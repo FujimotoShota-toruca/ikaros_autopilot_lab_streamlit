@@ -354,22 +354,20 @@ if run_plan:
             break
 
 # Real-time auto advance (or manual nudge)
-# In real-time mode, 'auto' advances using autorefresh.
-tick_steps = 3  # per refresh
+# In real-time mode, 'auto' advances using an optional autorefresh component.
+tick_steps = 3  # steps per refresh
+
 if mode == "リアルタイム制御":
     if game.auto and (not game.done):
-        # autorefresh drives reruns
-        st_autorefresh = st.experimental_data_editor  # placeholder to avoid import confusion (not used)
-
-        # Streamlit's native autorefresh is in st_autorefresh (streamlit>=1.25+).
-        # We'll call it if available, else fall back to manual stepping.
         try:
-            from streamlit_autorefresh import st_autorefresh as _st_autorefresh  # optional package
-            _st_autorefresh(interval=350, key="tick")
+            # Optional dependency (recommended on Streamlit Cloud):
+            #   pip install streamlit-autorefresh
+            from streamlit_autorefresh import st_autorefresh as _st_autorefresh  # type: ignore
+
+            _st_autorefresh(interval=350, key="tick")  # rerun ~3 times/sec
             step_n(tick_steps, beta_deg=game.beta_deg)
         except Exception:
-            # No extra dependency; use built-in st.experimental_rerun with a soft hint:
-            # We do a small step per run when user presses buttons.
+            # Fallback: no periodic refresh available. Use the manual nudge button below.
             pass
 
 # Manual single nudge (works even without autorefresh)
