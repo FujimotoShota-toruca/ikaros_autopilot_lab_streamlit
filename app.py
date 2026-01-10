@@ -1,18 +1,19 @@
-# IKAROS β-GO! (HTV-GO style, ALL Vega/Altair) - SRP only
+# IKAROS β-GO! (HTV-GO style, Vega/Altair) - SRP only
 # ------------------------------------------------------------
-# v5 fixes & upgrades:
-# - FIX: numpy 2.x removed np.trapz in some builds -> use our own trapezoid integrator.
-# - Add Orbit (2D) chart (Altair): actual / nominal / prediction + Earth/Venus orbits.
-# - Reduce legend duplication in main error chart.
-# - Add initial offset (position/velocity) for better game balance: "do nothing -> bad".
-# - Keep everything Vega/Altair (no Matplotlib).
+# v6 changes (from v5):
+# - Orbit (2D) "went crazy" fix: explicitly set line order by time ("day") to avoid Vega-Lite sorting by x.
+# - β control: slider + number input (direct typing) kept in sync.
+# - "Next proposal": 2 prediction lines:
+#     (1) Hold current β
+#     (2) Switch now to nominal β schedule
+#   Both shown on Error(main) and Orbit(2D).
 # ------------------------------------------------------------
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 import streamlit as st
@@ -55,21 +56,21 @@ def angle_between(u: np.ndarray, v: np.ndarray) -> float:
     c = float(np.clip(np.dot(uu, vv), -1.0, 1.0))
     return math.acos(c)
 
-def trapz_integral(y: List[float], x: List[float]) -> float:
-    """Trapezoidal integration without relying on numpy.trapz/trapezoid."""
-    if len(y) < 2 or len(x) < 2:
-        return float(y[-1]) if y else 0.0
-    s = 0.0
-    for i in range(1, len(y)):
-        dx = float(x[i] - x[i-1])
-        s += 0.5 * dx * float(y[i] + y[i-1])
-    return s
-
 def downsample_indices(n: int, max_n: int) -> List[int]:
     if n <= max_n:
         return list(range(n))
     step = int(math.ceil(n / max_n))
     return list(range(0, n, step))
+
+def trapz(y: List[float], x: List[float]) -> float:
+    """Own trapezoidal integration (avoid numpy trapz availability issues)."""
+    if len(y) < 2 or len(x) < 2:
+        return 0.0
+    s = 0.0
+    for i in range(1, min(len(y), len(x))):
+        dx = float(x[i] - x[i-1])
+        s += 0.5 * (float(y[i]) + float(y[i-1])) * dx
+    return float(s)
 
 
 # -----------------------------
@@ -94,13 +95,9 @@ def planet_pos(r: float, n: float, t_yr: float, phase: float) -> np.ndarray:
     a = n * t_yr + phase
     return np.array([r * math.cos(a), r * math.sin(a)], dtype=float)
 
-
-# -----------------------------
 # Baseline transfer-like start (Hohmann-ish)
-# -----------------------------
 A_H = 0.5 * (R_E + R_V)
 T_HALF_YR = 0.5 * math.sqrt(A_H**3)  # because MU=4π²
-T_HALF_DAYS = T_HALF_YR * 365.25
 
 def hohmann_aphelion_speed() -> float:
     r = R_E
@@ -117,12 +114,10 @@ def aligned_venus_phase() -> float:
 # SRP model (β only, in-plane)
 # -----------------------------
 def power_frac(r_sc: np.ndarray, beta_deg: float) -> float:
-    # power ∝ (1/r^2) * cos(|β|)
     r = max(norm(r_sc), 1e-9)
     return float(np.clip(math.cos(abs(rad(beta_deg))) / (r*r), 0.0, 2.0))
 
 def srp_accel(r_sc: np.ndarray, beta_deg: float, a0: float) -> np.ndarray:
-    # magnitude ∝ (1/r^2) * cos^2(beta), direction along in-plane sail normal
     r = max(norm(r_sc), 1e-9)
     beta = rad(beta_deg)
     r_hat = unit(r_sc)
@@ -161,7 +156,6 @@ def rk4_step(state: np.ndarray, beta_deg: float, a0: float, dt: float) -> np.nda
 # Nominal plan (simple schedule)
 # -----------------------------
 def nominal_beta_schedule(t_days: float) -> float:
-    # Change points create "guidance phases" (you can tweak later)
     if t_days < 70:
         return -20.0
     if t_days < 100:
@@ -170,35 +164,27 @@ def nominal_beta_schedule(t_days: float) -> float:
 
 
 # -----------------------------
-# Config / State
+# Game config/state
 # -----------------------------
 @dataclass
 class Config:
-    # simulation
     dt_days: float = 0.5
     time_limit_days: float = 220.0
-    pred_horizon_days: float = 90.0
-    nominal_padding_days: float = 180.0  # must exceed pred horizon to avoid weird reference
+    pred_horizon_days: float = 80.0
+    nominal_padding_days: float = 160.0
     a0: float = 0.020
-
-    # mission-ish constraints
+    venus_phase_offset_deg: float = 18.0
     comm_angle_deg: float = 12.0
     power_ok: float = 0.75
-    err_ok: float = 0.008  # tighter by default
-
-    # ops resource (attitude/ops)
+    err_ok: float = 0.020
     fuel_start: float = 120.0
     fuel_per_deg: float = 0.35
     hard_mode: bool = False
-
-    # refresh
-    refresh_ms: int = 1000
+    refresh_ms: int = 900
     ticks_per_refresh: int = 1
-
-    # initial offset (game balance)
-    init_pos_offset_au: float = 0.006   # position error magnitude
-    init_vel_offset_auyr: float = 0.000 # velocity error magnitude
-    init_beta_deg: float = 0.0          # start β away from nominal
+    init_pos_offset_au: float = 0.008
+    init_vel_offset_auyr: float = 0.006
+    init_beta_deg: float = -20.0
 
 @dataclass
 class SimState:
@@ -209,7 +195,6 @@ class SimState:
     dv_mps: float
     accel_ums2: float
     phase: str  # play/result
-
     # logs
     t_days: List[float]
     rx: List[float]
@@ -232,16 +217,18 @@ def earth_angle_deg(r_sc: np.ndarray, t_yr: float) -> float:
 def comm_window_active(r_sc: np.ndarray, t_yr: float, cfg: Config) -> bool:
     return earth_angle_deg(r_sc, t_yr) >= cfg.comm_angle_deg
 
+def venus_phase(cfg: Config) -> float:
+    return aligned_venus_phase() + rad(cfg.venus_phase_offset_deg)
+
 
 def init_state(cfg: Config) -> SimState:
-    # Nominal initial heliocentric state
+    # Start from transfer-like state + initial errors
     r0 = np.array([R_E, 0.0], dtype=float)
     v0 = np.array([0.0, V_APH], dtype=float)
 
-    # Add a deliberate navigation/dispersion offset (game balance)
-    # (simple: +y position offset; +x velocity offset)
-    r0 = r0 + np.array([0.0, cfg.init_pos_offset_au], dtype=float)
-    v0 = v0 + np.array([cfg.init_vel_offset_auyr, 0.0], dtype=float)
+    # Add deterministic offset: "start a bit off nominal"
+    r0 = r0 + np.array([cfg.init_pos_offset_au, -0.5*cfg.init_pos_offset_au], dtype=float)
+    v0 = v0 + np.array([0.5*cfg.init_vel_offset_auyr, -cfg.init_vel_offset_auyr], dtype=float)
 
     x0 = np.array([r0[0], r0[1], v0[0], v0[1]], dtype=float)
 
@@ -270,11 +257,12 @@ def init_state(cfg: Config) -> SimState:
 # Nominal precompute (cached)
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def simulate_nominal_cached(dt_days: float, time_limit_days: float, padding_days: float, a0: float) -> Dict[str, np.ndarray]:
+def simulate_nominal_cached(dt_days: float, time_limit_days: float, padding_days: float, a0: float, venus_phase_offset_deg: float) -> Dict[str, np.ndarray]:
     dt_yr = dt_days / 365.25
     total_days = time_limit_days + padding_days
     steps = int(math.ceil(total_days / dt_days)) + 1
 
+    # IMPORTANT: nominal starts from the *ideal* initial state (no offsets)
     r0 = np.array([R_E, 0.0], dtype=float)
     v0 = np.array([0.0, V_APH], dtype=float)
     x = np.array([r0[0], r0[1], v0[0], v0[1]], dtype=float)
@@ -293,20 +281,23 @@ def simulate_nominal_cached(dt_days: float, time_limit_days: float, padding_days
 
     return {"t_days": t_days, "r": r_nom}
 
+
 def nominal_at_time(nom: Dict[str, np.ndarray], cfg: Config, t_days: float) -> np.ndarray:
     idx = int(round(t_days / cfg.dt_days))
     idx = int(clamp(idx, 0, len(nom["t_days"]) - 1))
     return nom["r"][idx]
 
 
-def predict_future(state: SimState, cfg: Config, nom: Dict[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (t_future_days, err_future, r_future[steps,2]) under constant β from current state."""
-    # Safety: ensure nominal padding is enough even if teacher changes
-    pad_needed = cfg.pred_horizon_days + 20.0
-    if cfg.nominal_padding_days < pad_needed:
-        # This only affects cached nominal; UI suggests reset if changed.
-        pass
-
+# -----------------------------
+# Prediction (two modes)
+# -----------------------------
+def predict_future(state: SimState, cfg: Config, nom: Dict[str, np.ndarray], mode: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    mode:
+      - "hold": hold current β
+      - "nominal": switch to nominal schedule immediately
+    returns: (t_future_days, r_future[N,2], err_future[N])
+    """
     dt_yr = cfg.dt_days / 365.25
     steps = int(max(2, round(cfg.pred_horizon_days / cfg.dt_days)))
 
@@ -314,21 +305,25 @@ def predict_future(state: SimState, cfg: Config, nom: Dict[str, np.ndarray]) -> 
     t_yr = state.t_yr
 
     t_out = np.zeros(steps, dtype=float)
-    e_out = np.zeros(steps, dtype=float)
     r_out = np.zeros((steps, 2), dtype=float)
+    e_out = np.zeros(steps, dtype=float)
 
     for i in range(steps):
         td = t_yr * 365.25
-        r_nom = nominal_at_time(nom, cfg, td)
-
         t_out[i] = td
         r_out[i] = x[:2]
-        e_out[i] = norm(r_out[i] - r_nom)
+        r_nom = nominal_at_time(nom, cfg, td)
+        e_out[i] = norm(x[:2] - r_nom)
 
-        x = rk4_step(x, beta_deg=state.beta_deg, a0=cfg.a0, dt=dt_yr)
+        if mode == "hold":
+            b = state.beta_deg
+        else:
+            b = nominal_beta_schedule(td)
+
+        x = rk4_step(x, beta_deg=b, a0=cfg.a0, dt=dt_yr)
         t_yr += dt_yr
 
-    return t_out, e_out, r_out
+    return t_out, r_out, e_out
 
 
 # -----------------------------
@@ -340,15 +335,14 @@ def compute_score(state: SimState, cfg: Config) -> Tuple[float, Dict[str, float]
     pwr = state.power
 
     within = [1.0 if e <= cfg.err_ok else 0.0 for e in err]
-    in_band_days = trapz_integral(within, t)
+    in_band_days = trapz(within, t)
 
     track_reward = 6.0 * in_band_days
-
-    err_int = trapz_integral(err, t)
+    err_int = trapz(err, t)
     err_pen = 60.0 * err_int
 
     low = [1.0 if p < cfg.power_ok else 0.0 for p in pwr]
-    low_power_days = trapz_integral(low, t)
+    low_power_days = trapz(low, t)
     power_pen = 15.0 * low_power_days
 
     fuel_used = cfg.fuel_start - state.fuel
@@ -375,7 +369,7 @@ def compute_score(state: SimState, cfg: Config) -> Tuple[float, Dict[str, float]
 
 
 # -----------------------------
-# Vega (Altair) charts
+# Vega charts
 # -----------------------------
 def comm_rect_df(state: SimState, cfg: Config) -> List[Dict[str, float]]:
     if len(state.t_days) < 2:
@@ -395,18 +389,26 @@ def comm_rect_df(state: SimState, cfg: Config) -> List[Dict[str, float]]:
     return rows
 
 
-def alt_error_chart(state: SimState, cfg: Config, t_pred: np.ndarray, e_pred: np.ndarray, height: int = 380) -> alt.Chart:
+def alt_error_chart(state: SimState, cfg: Config, pred_hold: Tuple[np.ndarray, np.ndarray, np.ndarray], pred_nom: Tuple[np.ndarray, np.ndarray, np.ndarray], height: int = 360) -> alt.Chart:
+    t_hold, _, e_hold = pred_hold
+    t_nom, _, e_nom = pred_nom
+
     rows = []
     rows += [{"day": float(d), "value": float(v), "series": "誤差（実）"} for d, v in zip(state.t_days, state.orbit_err)]
-    rows += [{"day": float(d), "value": float(v), "series": "誤差（予測:β固定）"} for d, v in zip(t_pred, e_pred)]
+    rows += [{"day": float(d), "value": float(v), "series": "予測（β固定）"} for d, v in zip(t_hold, e_hold)]
+    rows += [{"day": float(d), "value": float(v), "series": "予測（ノミナルへ戻す）"} for d, v in zip(t_nom, e_nom)]
     if state.t_days:
+        x_max = float(max(state.t_days[-1], float(t_hold[-1]), float(t_nom[-1])))
         rows += [{"day": float(state.t_days[0]), "value": 0.0, "series": "ノミナル(0)"},
-                 {"day": float(max(state.t_days[-1], float(t_pred[-1]))), "value": 0.0, "series": "ノミナル(0)"}]
+                 {"day": x_max, "value": 0.0, "series": "ノミナル(0)"}]
 
-    x_min = float(min(state.t_days[0], float(t_pred[0]))) if state.t_days else 0.0
-    x_max = float(max(state.t_days[-1], float(t_pred[-1]))) if state.t_days else cfg.time_limit_days
+    # Determine x-range for band
+    if rows:
+        xs = [r["day"] for r in rows]
+        x_min, x_max = float(min(xs)), float(max(xs))
+    else:
+        x_min, x_max = 0.0, cfg.time_limit_days
 
-    # tolerance band 0..err_ok
     band_df = [{"day": x_min, "y0": 0.0, "y1": cfg.err_ok}, {"day": x_max, "y0": 0.0, "y1": cfg.err_ok}]
     band = alt.Chart(alt.Data(values=band_df)).mark_area(opacity=0.12).encode(
         x=alt.X("day:Q", title="日数"),
@@ -414,7 +416,6 @@ def alt_error_chart(state: SimState, cfg: Config, t_pred: np.ndarray, e_pred: np
         y2="y1:Q",
     )
 
-    # comm windows background
     rects = comm_rect_df(state, cfg)
     comm_layer = alt.Chart(alt.Data(values=rects)).mark_rect(opacity=0.08).encode(
         x="x0:Q", x2="x1:Q",
@@ -427,10 +428,9 @@ def alt_error_chart(state: SimState, cfg: Config, t_pred: np.ndarray, e_pred: np
         color=alt.Color("series:N", legend=alt.Legend(title="")),
         strokeDash=alt.StrokeDash(
             "series:N",
-            legend=None,  # prevent duplicate legend
             scale=alt.Scale(
-                domain=["誤差（実）", "誤差（予測:β固定）", "ノミナル(0)"],
-                range=[[1, 0], [6, 3], [2, 2]]
+                domain=["誤差（実）","予測（β固定）","予測（ノミナルへ戻す）","ノミナル(0)"],
+                range=[[1,0],[6,3],[2,2],[1,1]]
             )
         )
     )
@@ -460,41 +460,48 @@ def alt_beta(t: List[float], beta: List[float], height: int = 130) -> alt.Chart:
     ).properties(height=height)
 
 
-def alt_orbit_chart(state: SimState, cfg: Config, nom: Dict[str, np.ndarray], t_pred: np.ndarray, r_pred: np.ndarray, height: int = 330) -> alt.Chart:
-    # Choose time range up to max(pred end, current)
-    t_end = float(max(state.t_days[-1] if state.t_days else 0.0, float(t_pred[-1])))
-    # nominal subset
-    t_nom = nom["t_days"]
-    r_nom = nom["r"]
-    idx_end = int(clamp(int(round(t_end / cfg.dt_days)), 0, len(t_nom) - 1))
+def alt_orbit_chart(state: SimState, cfg: Config, nom: Dict[str, np.ndarray], pred_hold: Tuple[np.ndarray, np.ndarray, np.ndarray], pred_nom: Tuple[np.ndarray, np.ndarray, np.ndarray], height: int = 340) -> alt.Chart:
+    t_hold, r_hold, _ = pred_hold
+    t_nom, r_nom_pred, _ = pred_nom
 
-    # Downsample to keep it light
-    max_pts = 900
+    # nominal subset up to max time shown
+    t_end = float(max(state.t_days[-1] if state.t_days else 0.0, float(t_hold[-1]), float(t_nom[-1])))
+    idx_end = int(clamp(int(round(t_end / cfg.dt_days)), 0, len(nom["t_days"]) - 1))
+
+    max_pts = 750
     idx_a = downsample_indices(len(state.rx), max_pts)
     idx_n = downsample_indices(idx_end + 1, max_pts)
-    idx_p = downsample_indices(len(r_pred), max_pts)
+    idx_ph = downsample_indices(len(r_hold), max_pts)
+    idx_pn = downsample_indices(len(r_nom_pred), max_pts)
 
     rows = []
+    # actual orbit (ordered by day)
     for i in idx_a:
-        rows.append({"x": float(state.rx[i]), "y": float(state.ry[i]), "series": "実（軌道）"})
+        rows.append({"day": float(state.t_days[i]), "x": float(state.rx[i]), "y": float(state.ry[i]), "series": "実（軌道）"})
+    # nominal orbit (ordered by nominal day)
     for i in idx_n:
-        rows.append({"x": float(r_nom[i,0]), "y": float(r_nom[i,1]), "series": "ノミナル（軌道）"})
-    for i in idx_p:
-        rows.append({"x": float(r_pred[i,0]), "y": float(r_pred[i,1]), "series": "予測（β固定）"})
+        rows.append({"day": float(nom["t_days"][i]), "x": float(nom["r"][i,0]), "y": float(nom["r"][i,1]), "series": "ノミナル（軌道）"})
+    # prediction: hold
+    for i in idx_ph:
+        rows.append({"day": float(t_hold[i]), "x": float(r_hold[i,0]), "y": float(r_hold[i,1]), "series": "予測（β固定）"})
+    # prediction: switch to nominal
+    for i in idx_pn:
+        rows.append({"day": float(t_nom[i]), "x": float(r_nom_pred[i,0]), "y": float(r_nom_pred[i,1]), "series": "予測（ノミナルへ）"})
 
-    # Orbits (Earth/Venus circles)
-    th = np.linspace(0, 2*math.pi, 180)
-    for a in th[::2]:
-        rows.append({"x": float(R_E*math.cos(a)), "y": float(R_E*math.sin(a)), "series": "地球軌道"})
-        rows.append({"x": float(R_V*math.cos(a)), "y": float(R_V*math.sin(a)), "series": "金星軌道"})
+    # Earth/Venus circular orbits (parameter = theta index; not time)
+    th = np.linspace(0, 2*math.pi, 240)
+    for k, ang in enumerate(th):
+        rows.append({"day": float(k), "x": float(R_E*math.cos(ang)), "y": float(R_E*math.sin(ang)), "series": "地球軌道"})
+        rows.append({"day": float(k), "x": float(R_V*math.cos(ang)), "y": float(R_V*math.sin(ang)), "series": "金星軌道"})
 
-    # Current body positions
-    r_e = planet_pos(R_E, N_E, (state.t_days[-1]/365.25) if state.t_days else 0.0, 0.0)
-    r_v = planet_pos(R_V, N_V, (state.t_days[-1]/365.25) if state.t_days else 0.0, aligned_venus_phase())
+    # Markers (current)
+    r_e = planet_pos(R_E, N_E, state.t_yr, 0.0)
+    r_v = planet_pos(R_V, N_V, state.t_yr, venus_phase(cfg))
     markers = [
         {"x": 0.0, "y": 0.0, "name": "Sun"},
         {"x": float(r_e[0]), "y": float(r_e[1]), "name": "Earth"},
         {"x": float(r_v[0]), "y": float(r_v[1]), "name": "Venus"},
+        {"x": float(state.x[0]), "y": float(state.x[1]), "name": f"Sail β={state.beta_deg:+.0f}°"},
     ]
 
     domain = 1.35
@@ -502,36 +509,43 @@ def alt_orbit_chart(state: SimState, cfg: Config, nom: Dict[str, np.ndarray], t_
         x=alt.X("x:Q", title="x (AU)", scale=alt.Scale(domain=[-domain, domain])),
         y=alt.Y("y:Q", title="y (AU)", scale=alt.Scale(domain=[-domain, domain])),
         color=alt.Color("series:N", legend=alt.Legend(title="")),
+        order=alt.Order("day:Q"),  # <<< critical fix (avoid x-sorting)
+        strokeWidth=alt.StrokeWidth("series:N", legend=None,
+                                   scale=alt.Scale(domain=["実（軌道）","ノミナル（軌道）","予測（β固定）","予測（ノミナルへ）","地球軌道","金星軌道"],
+                                                   range=[2.2,1.6,1.6,1.6,1.0,1.0])),
         strokeDash=alt.StrokeDash(
             "series:N",
             legend=None,
             scale=alt.Scale(
-                domain=["実（軌道）","ノミナル（軌道）","予測（β固定）","地球軌道","金星軌道"],
-                range=[[1,0],[6,3],[2,2],[4,4],[4,4]]
+                domain=["実（軌道）","ノミナル（軌道）","予測（β固定）","予測（ノミナルへ）","地球軌道","金星軌道"],
+                range=[[1,0],[6,3],[2,2],[4,2],[4,4],[4,4]]
             )
         ),
-        opacity=alt.Opacity("series:N", legend=None,
-                            scale=alt.Scale(domain=["実（軌道）","ノミナル（軌道）","予測（β固定）","地球軌道","金星軌道"],
-                                            range=[1.0,0.9,0.9,0.35,0.35])),
+        opacity=alt.Opacity(
+            "series:N", legend=None,
+            scale=alt.Scale(domain=["実（軌道）","ノミナル（軌道）","予測（β固定）","予測（ノミナルへ）","地球軌道","金星軌道"],
+                            range=[1.0,0.9,0.9,0.9,0.25,0.25])
+        ),
         tooltip=[alt.Tooltip("series:N"), alt.Tooltip("x:Q", format=".3f"), alt.Tooltip("y:Q", format=".3f")]
     ).properties(height=height)
 
-    pts = alt.Chart(alt.Data(values=markers)).mark_point(size=80).encode(
+    pts = alt.Chart(alt.Data(values=markers)).mark_point(size=85).encode(
         x=alt.X("x:Q", scale=alt.Scale(domain=[-domain, domain])),
         y=alt.Y("y:Q", scale=alt.Scale(domain=[-domain, domain])),
         tooltip=[alt.Tooltip("name:N"), alt.Tooltip("x:Q", format=".3f"), alt.Tooltip("y:Q", format=".3f")]
     )
+
     return (base + pts).configure_axis(labelFontSize=12, titleFontSize=12).configure_legend(labelFontSize=12)
 
 
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="IKAROS β-GO! (Vega v5)", layout="wide")
+st.set_page_config(page_title="IKAROS β-GO! (Vega v6)", layout="wide")
 st.markdown("""<style>.block-container{padding-top:0.8rem;padding-bottom:0.8rem;}</style>""", unsafe_allow_html=True)
 
-st.title("☀️ IKAROS β-GO!（全部Vega v5）")
-st.caption("メインは軌道誤差。加えて“軌道（2D）”も戻した版。SRPの小ささは μm/s² と ΔV で見える化。")
+st.title("☀️ IKAROS β-GO!（全部Vega v6）")
+st.caption("軌道誤差（メイン）＋軌道（2D）。予測は2本：β固定 / ノミナルへ戻す。βはスライダー＋直打ち。")
 
 with st.sidebar:
     st.header("設定")
@@ -554,7 +568,7 @@ with st.sidebar:
 
     if show_teacher:
         st.divider()
-        st.subheader("先生モード：モデル/評価")
+        st.subheader("先生モード：モデル/表示")
         cfg.dt_days = st.slider("刻み(days)", 0.2, 2.0, cfg.dt_days, 0.1)
         cfg.time_limit_days = st.slider("制限時間(days)", 140.0, 420.0, cfg.time_limit_days, 5.0)
         cfg.pred_horizon_days = st.slider("予測ホライズン(days)", 20.0, 180.0, cfg.pred_horizon_days, 5.0)
@@ -566,30 +580,34 @@ with st.sidebar:
         cfg.fuel_start = st.slider("燃料（姿勢リソース）", 40.0, 240.0, cfg.fuel_start, 5.0)
         cfg.fuel_per_deg = st.slider("燃料/deg", 0.05, 1.0, cfg.fuel_per_deg, 0.05)
 
-# Fix for prediction weirdness when teacher sets too small padding:
-# we enforce a minimum padding relative to pred horizon (note: cached nominal depends on it).
+# Ensure padding >= horizon
 cfg.nominal_padding_days = max(cfg.nominal_padding_days, cfg.pred_horizon_days + 30.0)
 
 # Cached nominal
-nominal = simulate_nominal_cached(cfg.dt_days, cfg.time_limit_days, cfg.nominal_padding_days, cfg.a0)
+nominal = simulate_nominal_cached(cfg.dt_days, cfg.time_limit_days, cfg.nominal_padding_days, cfg.a0, cfg.venus_phase_offset_deg)
 
 # Session init
-if "sim_v5" not in st.session_state:
-    st.session_state.sim_v5 = init_state(cfg)
-    st.session_state.auto_v5 = True
+if "sim_v6" not in st.session_state or st.session_state.get("sim_cfg_sig") != (cfg.init_pos_offset_au, cfg.init_vel_offset_auyr, cfg.init_beta_deg, cfg.dt_days, cfg.a0, cfg.time_limit_days):
+    st.session_state.sim_v6 = init_state(cfg)
+    st.session_state.auto_v6 = True
+    st.session_state.sim_cfg_sig = (cfg.init_pos_offset_au, cfg.init_vel_offset_auyr, cfg.init_beta_deg, cfg.dt_days, cfg.a0, cfg.time_limit_days)
 
-state: SimState = st.session_state.sim_v5
+state: SimState = st.session_state.sim_v6
 
 def rerun():
     (st.rerun() if hasattr(st, "rerun") else st.experimental_rerun())
 
 def reset_all():
-    st.session_state.sim_v5 = init_state(cfg)
-    st.session_state.auto_v5 = True
+    st.session_state.sim_v6 = init_state(cfg)
+    st.session_state.auto_v6 = True
+    # sync UI beta
+    st.session_state.beta_slider = float(st.session_state.sim_v6.beta_deg)
+    st.session_state.beta_number = float(st.session_state.sim_v6.beta_deg)
     rerun()
 
-# Controls
-c1, c2, c3, c4, c5 = st.columns([1.0, 1.0, 1.0, 1.25, 1.25], gap="small")
+
+# Controls row
+c1, c2, c3, c4, c5 = st.columns([1.0, 1.0, 1.0, 1.35, 1.35], gap="small")
 with c1:
     if st.button("🔁 リセット", use_container_width=True):
         reset_all()
@@ -602,9 +620,11 @@ if cfg.hard_mode and state.fuel <= 0:
     lock_reason = "燃料切れ"
 
 def apply_beta_change(new_beta: float):
+    new_beta = float(clamp(new_beta, -75.0, 75.0))
+    if abs(new_beta - state.beta_deg) < 1e-9:
+        return
     if cfg.hard_mode and lock_reason is not None:
         return
-    new_beta = float(clamp(new_beta, -75.0, 75.0))
     d = abs(new_beta - state.beta_deg)
     cost = d * cfg.fuel_per_deg
     if cfg.hard_mode and state.fuel - cost < 0:
@@ -618,30 +638,44 @@ with c2:
 with c3:
     if st.button("➡ β +5°", use_container_width=True, disabled=(cfg.hard_mode and lock_reason is not None)):
         apply_beta_change(state.beta_deg + 5.0)
+
+# β slider + direct typing
+if "beta_slider" not in st.session_state:
+    st.session_state.beta_slider = float(state.beta_deg)
+if "beta_number" not in st.session_state:
+    st.session_state.beta_number = float(state.beta_deg)
+
+def on_beta_slider():
+    v = float(st.session_state.beta_slider)
+    st.session_state.beta_number = v
+    apply_beta_change(v)
+
+def on_beta_number():
+    v = float(st.session_state.beta_number)
+    st.session_state.beta_slider = v
+    apply_beta_change(v)
+
 with c4:
-    preset = st.selectbox("ワンタッチβ", ["-35°（内側へ）", "-20°（ノミナル寄り）", "0°（待ち）", "+20°（外側へ）"], index=2)
-    if preset.startswith("-35"):
-        apply_beta_change(-35.0)
-    elif preset.startswith("-20"):
-        apply_beta_change(-20.0)
-    elif preset.startswith("0"):
-        apply_beta_change(0.0)
-    else:
-        apply_beta_change(20.0)
+    st.slider("β角（deg）", -75.0, 75.0, float(st.session_state.beta_slider), 1.0,
+              key="beta_slider", on_change=on_beta_slider, disabled=(cfg.hard_mode and lock_reason is not None))
 with c5:
-    a, b = st.columns(2)
-    with a:
-        if st.button("⏸/▶ 自動進行", use_container_width=True):
-            st.session_state.auto_v5 = not st.session_state.auto_v5
-    with b:
-        if st.button("▶ 進める（約5日）", use_container_width=True):
-            st.session_state.manual_v5 = True
+    st.number_input("β角 直打ち（deg）", min_value=-75.0, max_value=75.0, value=float(st.session_state.beta_number),
+                    step=1.0, key="beta_number", on_change=on_beta_number, disabled=(cfg.hard_mode and lock_reason is not None))
 
-auto = st.session_state.auto_v5
-manual = st.session_state.get("manual_v5", False)
-st.session_state.manual_v5 = False
+# Play controls
+d1, d2 = st.columns(2)
+with d1:
+    if st.button("⏸/▶ 自動進行", use_container_width=True):
+        st.session_state.auto_v6 = not st.session_state.auto_v6
+with d2:
+    if st.button("▶ 進める（約5日）", use_container_width=True):
+        st.session_state.manual_v6 = True
 
-# HUD (always)
+auto = st.session_state.auto_v6
+manual = st.session_state.get("manual_v6", False)
+st.session_state.manual_v6 = False
+
+# HUD
 t_days_now = state.t_yr * 365.25
 r_sc = state.x[:2]
 pwr_now = power_frac(r_sc, state.beta_deg)
@@ -659,16 +693,17 @@ m2.metric("発電量", f"{pwr_now:.2f}", delta=("OK" if pwr_now >= cfg.power_ok 
 m3.metric("地球角", f"{ea_now:.1f}°", delta=("COMMS" if comm_ok else "NO-COMMS"))
 m4.metric("軌道誤差", f"{err_now:.3f} AU", delta=(f"帯≤{cfg.err_ok:.3f}" if err_now <= cfg.err_ok else "帯の外"))
 m5.metric("燃料", f"{state.fuel:.1f}")
-m6.metric("SRP加速度", f"{state.accel_ums2:.2f} μm/s²", help="SRPはμm/s²オーダー。大きなΔVは期待できない。")
+m6.metric("SRP加速度", f"{state.accel_ums2:.2f} μm/s²", help="太陽光圧はμm/s²オーダー。増えるΔVもゆっくり。")
 
 if cfg.hard_mode and lock_reason is not None:
     st.warning(f"β変更ロック中（高難易度）：{lock_reason}")
 
+
 # Logging
-def log_snapshot(td: float, r: np.ndarray, p: float, ea: float, err: float, dv: float, acc_ums2: float):
+def log_snapshot(td: float, x: np.ndarray, p: float, ea: float, err: float, dv: float, acc_ums2: float):
     state.t_days.append(float(td))
-    state.rx.append(float(r[0]))
-    state.ry.append(float(r[1]))
+    state.rx.append(float(x[0]))
+    state.ry.append(float(x[1]))
     state.beta.append(float(state.beta_deg))
     state.power.append(float(p))
     state.earth_angle.append(float(ea))
@@ -678,9 +713,8 @@ def log_snapshot(td: float, r: np.ndarray, p: float, ea: float, err: float, dv: 
     state.accel_log_ums2.append(float(acc_ums2))
 
 if not state.t_days and state.phase == "play":
-    log_snapshot(t_days_now, r_sc, pwr_now, ea_now, err_now, state.dv_mps, state.accel_ums2)
+    log_snapshot(t_days_now, state.x, pwr_now, ea_now, err_now, state.dv_mps, state.accel_ums2)
 
-# Integrate
 def integrate_steps(n_steps: int):
     dt_yr = cfg.dt_days / 365.25
     for _ in range(n_steps):
@@ -688,7 +722,7 @@ def integrate_steps(n_steps: int):
             state.phase = "result"
             break
 
-        # ΔV: integrate |a| dt (SRP-only)
+        # ΔV accumulate
         r = state.x[:2]
         a = srp_accel(r, state.beta_deg, cfg.a0)
         a_mps2_local = norm(a) * AUYR2_TO_MPS2
@@ -708,30 +742,30 @@ def integrate_steps(n_steps: int):
         a2 = srp_accel(r_sc2, state.beta_deg, cfg.a0)
         acc2_ums2 = norm(a2) * AUYR2_TO_MPS2 * 1e6
 
-        log_snapshot(td, r_sc2, p2, ea2, err2, state.dv_mps, acc2_ums2)
+        log_snapshot(td, state.x, p2, ea2, err2, state.dv_mps, acc2_ums2)
 
 # Advance
 if state.phase == "play":
     if auto and HAVE_AUTOREFRESH:
-        st_autorefresh(interval=cfg.refresh_ms, key="tick_v5")
+        st_autorefresh(interval=cfg.refresh_ms, key="tick_v6")
         integrate_steps(cfg.ticks_per_refresh)
     elif manual:
         integrate_steps(int(max(1, round(5.0 / cfg.dt_days))))
 
-# Prediction (error + orbit)
-t_pred, e_pred, r_pred = predict_future(state, cfg, nominal)
+# Predictions (two)
+pred_hold = predict_future(state, cfg, nominal, mode="hold")
+pred_nom = predict_future(state, cfg, nominal, mode="nominal")
 
-# Layout: error + orbit (left), live (right)
+# Layout
 L, R = st.columns([1.60, 1.0], gap="large")
-
 with L:
     st.subheader("軌道誤差（メイン）")
-    st.caption("実=実際 / 予測=いまのβ固定 / ノミナル=0 / 薄帯=許容誤差 / 背景薄帯=通信区間")
-    st.altair_chart(alt_error_chart(state, cfg, t_pred, e_pred), use_container_width=True)
+    st.caption("実=実際 / 予測①=β固定 / 予測②=ノミナルへ戻す / ノミナル=0 / 薄帯=許容誤差 / 背景薄帯=通信区間")
+    st.altair_chart(alt_error_chart(state, cfg, pred_hold, pred_nom), use_container_width=True)
 
     st.subheader("軌道（2D）")
-    st.caption("実（軌道）/ ノミナル（軌道）/ 予測（β固定）に加え、地球軌道・金星軌道も表示")
-    st.altair_chart(alt_orbit_chart(state, cfg, nominal, t_pred, r_pred), use_container_width=True)
+    st.caption("実（軌道）/ ノミナル（軌道）/ 予測①（β固定）/ 予測②（ノミナルへ） + 地球軌道・金星軌道")
+    st.altair_chart(alt_orbit_chart(state, cfg, nominal, pred_hold, pred_nom), use_container_width=True)
 
 with R:
     st.subheader("ライブ（全部Vega）")
@@ -753,11 +787,10 @@ with R:
     st.caption("β角（操作履歴）")
     st.altair_chart(alt_beta(state.t_days, state.beta), use_container_width=True)
 
-# Result screen
+# Result
 if state.phase == "result":
     st.divider()
-    st.header("📊 リザルト（Vega）")
-
+    st.header("📊 リザルト")
     score, breakdown = compute_score(state, cfg)
     st.subheader(f"スコア：{score:.0f} 点")
 
@@ -771,18 +804,8 @@ if state.phase == "result":
         st.write(breakdown)
 
     st.subheader("結果グラフ")
-    st.altair_chart(alt_error_chart(state, cfg, t_pred, e_pred, height=440), use_container_width=True)
-    st.altair_chart(alt_orbit_chart(state, cfg, nominal, t_pred, r_pred, height=380), use_container_width=True)
-
-    r1, r2 = st.columns(2, gap="large")
-    with r1:
-        st.altair_chart(alt_series(state.t_days, state.power, "power", rule=cfg.power_ok, height=220).properties(title="発電量"), use_container_width=True)
-        st.altair_chart(alt_series(state.t_days, state.dv_log, "m/s", height=220).properties(title="ΔV（SRPの小ささ）"), use_container_width=True)
-        st.altair_chart(alt_beta(state.t_days, state.beta, height=220).properties(title="β角"), use_container_width=True)
-    with r2:
-        st.altair_chart(alt_series(state.t_days, state.earth_angle, "deg", rule=cfg.comm_angle_deg, height=220).properties(title="地球角"), use_container_width=True)
-        st.altair_chart(alt_series(state.t_days, state.fuel_log, "fuel", height=220).properties(title="燃料（姿勢リソース）"), use_container_width=True)
-        st.altair_chart(alt_series(state.t_days, state.orbit_err, "AU", height=220).properties(title="誤差（実）"), use_container_width=True)
+    st.altair_chart(alt_error_chart(state, cfg, pred_hold, pred_nom, height=440), use_container_width=True)
+    st.altair_chart(alt_orbit_chart(state, cfg, nominal, pred_hold, pred_nom, height=380), use_container_width=True)
 
     st.divider()
     if st.button("もう一回（リセット）", use_container_width=True):
