@@ -395,12 +395,12 @@ def alt_error_chart(state: SimState, cfg: Config, pred_hold: Tuple[np.ndarray, n
 
     rows = []
     rows += [{"day": float(d), "value": float(v), "series": "誤差（実）"} for d, v in zip(state.t_days, state.orbit_err)]
-    rows += [{"day": float(d), "value": float(v), "series": "予測（β固定）"} for d, v in zip(t_hold, e_hold)]
-    rows += [{"day": float(d), "value": float(v), "series": "予測（ノミナルへ戻す）"} for d, v in zip(t_nom, e_nom)]
+    rows += [{"day": float(d), "value": float(v), "series": "予測①（β固定）"} for d, v in zip(t_hold, e_hold)]
+    rows += [{"day": float(d), "value": float(v), "series": "予測②（計画βへ復帰）"} for d, v in zip(t_nom, e_nom)]
     if state.t_days:
         x_max = float(max(state.t_days[-1], float(t_hold[-1]), float(t_nom[-1])))
-        rows += [{"day": float(state.t_days[0]), "value": 0.0, "series": "ノミナル(0)"},
-                 {"day": x_max, "value": 0.0, "series": "ノミナル(0)"}]
+        rows += [{"day": float(state.t_days[0]), "value": 0.0, "series": "ノミナル（計画=0誤差）"},
+                 {"day": x_max, "value": 0.0, "series": "ノミナル（計画=0誤差）"}]
 
     # Determine x-range for band
     if rows:
@@ -429,7 +429,7 @@ def alt_error_chart(state: SimState, cfg: Config, pred_hold: Tuple[np.ndarray, n
         strokeDash=alt.StrokeDash(
             "series:N",
             scale=alt.Scale(
-                domain=["誤差（実）","予測（β固定）","予測（ノミナルへ戻す）","ノミナル(0)"],
+                domain=["誤差（実）","予測①（β固定）","予測②（計画βへ復帰）","ノミナル（計画=0誤差）"],
                 range=[[1,0],[6,3],[2,2],[1,1]]
             )
         )
@@ -480,13 +480,13 @@ def alt_orbit_chart(state: SimState, cfg: Config, nom: Dict[str, np.ndarray], pr
         rows.append({"day": float(state.t_days[i]), "x": float(state.rx[i]), "y": float(state.ry[i]), "series": "実（軌道）"})
     # nominal orbit (ordered by nominal day)
     for i in idx_n:
-        rows.append({"day": float(nom["t_days"][i]), "x": float(nom["r"][i,0]), "y": float(nom["r"][i,1]), "series": "ノミナル（軌道）"})
+        rows.append({"day": float(nom["t_days"][i]), "x": float(nom["r"][i,0]), "y": float(nom["r"][i,1]), "series": "ノミナル（計画軌道）"})
     # prediction: hold
     for i in idx_ph:
-        rows.append({"day": float(t_hold[i]), "x": float(r_hold[i,0]), "y": float(r_hold[i,1]), "series": "予測（β固定）"})
+        rows.append({"day": float(t_hold[i]), "x": float(r_hold[i,0]), "y": float(r_hold[i,1]), "series": "予測①（β固定）"})
     # prediction: switch to nominal
     for i in idx_pn:
-        rows.append({"day": float(t_nom[i]), "x": float(r_nom_pred[i,0]), "y": float(r_nom_pred[i,1]), "series": "予測（ノミナルへ）"})
+        rows.append({"day": float(t_nom[i]), "x": float(r_nom_pred[i,0]), "y": float(r_nom_pred[i,1]), "series": "予測②（計画βへ復帰）"})
 
     # Earth/Venus circular orbits (parameter = theta index; not time)
     th = np.linspace(0, 2*math.pi, 240)
@@ -511,19 +511,19 @@ def alt_orbit_chart(state: SimState, cfg: Config, nom: Dict[str, np.ndarray], pr
         color=alt.Color("series:N", legend=alt.Legend(title="")),
         order=alt.Order("day:Q"),  # <<< critical fix (avoid x-sorting)
         strokeWidth=alt.StrokeWidth("series:N", legend=None,
-                                   scale=alt.Scale(domain=["実（軌道）","ノミナル（軌道）","予測（β固定）","予測（ノミナルへ）","地球軌道","金星軌道"],
+                                   scale=alt.Scale(domain=["実（軌道）","ノミナル（計画軌道）","予測①（β固定）","予測②（計画βへ復帰）","地球軌道","金星軌道"],
                                                    range=[2.2,1.6,1.6,1.6,1.0,1.0])),
         strokeDash=alt.StrokeDash(
             "series:N",
             legend=None,
             scale=alt.Scale(
-                domain=["実（軌道）","ノミナル（軌道）","予測（β固定）","予測（ノミナルへ）","地球軌道","金星軌道"],
+                domain=["実（軌道）","ノミナル（計画軌道）","予測①（β固定）","予測②（計画βへ復帰）","地球軌道","金星軌道"],
                 range=[[1,0],[6,3],[2,2],[4,2],[4,4],[4,4]]
             )
         ),
         opacity=alt.Opacity(
             "series:N", legend=None,
-            scale=alt.Scale(domain=["実（軌道）","ノミナル（軌道）","予測（β固定）","予測（ノミナルへ）","地球軌道","金星軌道"],
+            scale=alt.Scale(domain=["実（軌道）","ノミナル（計画軌道）","予測①（β固定）","予測②（計画βへ復帰）","地球軌道","金星軌道"],
                             range=[1.0,0.9,0.9,0.9,0.25,0.25])
         ),
         tooltip=[alt.Tooltip("series:N"), alt.Tooltip("x:Q", format=".3f"), alt.Tooltip("y:Q", format=".3f")]
@@ -538,6 +538,24 @@ def alt_orbit_chart(state: SimState, cfg: Config, nom: Dict[str, np.ndarray], pr
     return (base + pts).configure_axis(labelFontSize=12, titleFontSize=12).configure_legend(labelFontSize=12)
 
 
+
+def alt_plan_beta_chart(cfg: Config, height: int = 120) -> alt.Chart:
+    # Show the planned (nominal) β schedule as a step chart.
+    # Use 1-day resolution for readability.
+    days = list(range(0, int(cfg.time_limit_days) + 1))
+    betas = [float(nominal_beta_schedule(d)) for d in days]
+    df = [{"day": float(d), "beta": float(b)} for d, b in zip(days, betas)]
+    return (
+        alt.Chart(alt.Data(values=df))
+        .mark_step(interpolate="step-after")
+        .encode(
+            x=alt.X("day:Q", title="日数"),
+            y=alt.Y("beta:Q", title="計画β（deg）"),
+            tooltip=[alt.Tooltip("day:Q", title="day"), alt.Tooltip("beta:Q", title="β(deg)")],
+        )
+        .properties(height=height)
+    )
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -546,6 +564,17 @@ st.markdown("""<style>.block-container{padding-top:0.8rem;padding-bottom:0.8rem;
 
 st.title("☀️ IKAROS β-GO!（全部Vega v6）")
 st.caption("軌道誤差（メイン）＋軌道（2D）。予測は2本：β固定 / ノミナルへ戻す。βはスライダー＋直打ち。")
+
+with st.expander("ノミナル（計画）とは？（この教材での定義）", expanded=True):
+    st.markdown(
+        """
+- **ノミナル（計画）**は、運用チームが事前に作る **「目標（参照）軌道」**です。  
+  ここでは **理想的な初期条件（誤差ゼロ）** から、**計画β（ノミナルβ）** に従って飛んだときの軌道をノミナルとしています。
+- **軌道誤差**は、同じ日数の位置の差：  `| r_実(t) − r_ノミナル(t) |`（AU）
+- **予測①（β固定）**：いまのβのまま進んだら、誤差がどうなる？  
+- **予測②（計画βへ復帰）**：いまから **計画β** に戻したら、誤差がどうなる？
+"""
+    )
 
 with st.sidebar:
     st.header("設定")
@@ -760,15 +789,19 @@ pred_nom = predict_future(state, cfg, nominal, mode="nominal")
 L, R = st.columns([1.60, 1.0], gap="large")
 with L:
     st.subheader("軌道誤差（メイン）")
-    st.caption("実=実際 / 予測①=β固定 / 予測②=ノミナルへ戻す / ノミナル=0 / 薄帯=許容誤差 / 背景薄帯=通信区間")
+    st.caption("実=実際 / 予測①=β固定 / 予測②=計画βへ復帰 / ノミナル（計画）=0誤差 / 薄帯=許容誤差 / 背景薄帯=通信区間")
     st.altair_chart(alt_error_chart(state, cfg, pred_hold, pred_nom), use_container_width=True)
 
     st.subheader("軌道（2D）")
-    st.caption("実（軌道）/ ノミナル（軌道）/ 予測①（β固定）/ 予測②（ノミナルへ） + 地球軌道・金星軌道")
+    st.caption("実（軌道）/ ノミナル（計画軌道）/ 予測①（β固定）/ 予測②（ノミナルへ） + 地球軌道・金星軌道")
     st.altair_chart(alt_orbit_chart(state, cfg, nominal, pred_hold, pred_nom), use_container_width=True)
 
 with R:
     st.subheader("ライブ（全部Vega）")
+
+    st.caption("計画β（ノミナルβ）— “ノミナル（計画）”で使っているβスケジュール")
+    st.altair_chart(alt_plan_beta_chart(cfg), use_container_width=True)
+
     st.caption("発電量（相対）— 閾値より下は運用がきつい")
     st.altair_chart(alt_series(state.t_days, state.power, "power", rule=cfg.power_ok), use_container_width=True)
 
