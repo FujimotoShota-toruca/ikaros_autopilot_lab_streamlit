@@ -1,431 +1,494 @@
-# IKAROS GO! (Streamlit) - ultra simple version
+# IKAROS β-GO! (Streamlit)
 # ------------------------------------------------------------
-# Goal: HTV GO!-level simplicity (one screen, short play, minimal explanation).
-# Safe: no exec/eval.
+# HTV GO!!-like simplicity:
+# - Orbits advance automatically (planets are analytic circles).
+# - Player controls ONE parameter: β (signed cone angle in 2D).
+# - Mission: Guide from Earth orbit to Venus orbit and get close.
 #
-# Controls:
-# - One slider "ハンドル" (-100..100): bias panels to turn.
-# - One button "すすめる": advances time.
+# Modes:
+# 1) リアルタイム制御：βをその場で変えて誘導（自動進行/一時停止あり）
+# 2) 事前角度指定：βを3区間だけ先に決めて一気に実行
 #
-# Stages (3):
-# 1) 太陽を向く（発電ゲージを満たす）
-# 2) ゆらゆらセンサーでも安定
-# 3) 目的地へ（少しズラして進む）
+# Extra:
+# - 時間無制限（練習）
 #
-# Teacher mode (optional):
-# - shows advanced knobs and logs (collapsed by default)
+# Safety:
+# - No exec/eval. Single-file app deployable to Streamlit Community Cloud.
+#
+# NOTE: Educational toy model (not a high-fidelity mission design tool).
 # ------------------------------------------------------------
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 
 
+# -----------------------------
+# Math helpers
+# -----------------------------
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
+def rad(deg: float) -> float:
+    return deg * math.pi / 180.0
 
-def wrap_pi(a: float) -> float:
-    a = (a + math.pi) % (2 * math.pi) - math.pi
-    if a <= -math.pi:
-        a += 2 * math.pi
-    return a
+def deg(rad_: float) -> float:
+    return rad_ * 180.0 / math.pi
+
+def norm(v: np.ndarray) -> float:
+    return float(np.linalg.norm(v))
+
+def unit(v: np.ndarray) -> np.ndarray:
+    n = norm(v)
+    if n <= 1e-12:
+        return np.array([1.0, 0.0], dtype=float)
+    return v / n
+
+def rot90(v: np.ndarray) -> np.ndarray:
+    # CCW 90 degrees
+    return np.array([-v[1], v[0]], dtype=float)
 
 
-def deg(x: float) -> float:
-    return x * 180.0 / math.pi
+# -----------------------------
+# Solar system toy constants (AU, year)
+# -----------------------------
+MU = 4.0 * math.pi * math.pi  # AU^3 / yr^2 => Earth period = 1 yr at r=1
+R_E = 1.0
+R_V = 0.723  # Venus semi-major axis (AU)
+
+def mean_motion(r: float) -> float:
+    return math.sqrt(MU / (r**3))
+
+N_E = mean_motion(R_E)
+N_V = mean_motion(R_V)
+
+# Game tuning
+DT_DAYS_DEFAULT = 0.5
+DT = DT_DAYS_DEFAULT / 365.25  # yr
+
+# "Solar sail" strength (toy). Larger -> faster transfers (more game-like).
+A0_DEFAULT = 0.030  # AU/yr^2 (toy)
+
+# Win condition
+VENUS_HIT_RADIUS = 0.035  # AU (~5.2 million km) toy threshold
 
 
-def rad(x: float) -> float:
-    return x * math.pi / 180.0
+# -----------------------------
+# Sail model (single control β)
+# -----------------------------
+def sail_accel(r_sc: np.ndarray, beta_deg: float, a0: float) -> np.ndarray:
+    """Idealized planar sail.
+    - r_sc is heliocentric position.
+    - β is signed cone angle (deg) rotating sail normal within the orbital plane.
+        β>0 accelerates along prograde tangential direction (outward transfer),
+        β<0 accelerates along retrograde tangential direction (inward transfer).
+    - magnitude ∝ cos^2(|β|)
+    """
+    beta = rad(beta_deg)
+    r_hat = unit(r_sc)         # sun->spacecraft direction (radial outward)
+    t_hat = rot90(r_hat)       # prograde tangential (CCW) direction
+
+    c = math.cos(beta)
+    s = math.sin(beta)
+
+    # Sail normal in plane (rotated from radial toward tangential)
+    n_hat = c * r_hat + s * t_hat
+
+    # Ideal sail acceleration magnitude scales with cos^2(beta)
+    mag = a0 * (c * c)
+
+    return mag * n_hat
 
 
-def vec(theta: float) -> np.ndarray:
-    return np.array([math.cos(theta), math.sin(theta)], dtype=float)
+# -----------------------------
+# Dynamics integration (RK4)
+# -----------------------------
+def grav_accel(r: np.ndarray) -> np.ndarray:
+    d = norm(r)
+    return -MU * r / (d**3 + 1e-12)
+
+def f(state: np.ndarray, beta_deg: float, a0: float) -> np.ndarray:
+    # state = [x,y,vx,vy]
+    r = state[:2]
+    v = state[2:]
+    a = grav_accel(r) + sail_accel(r, beta_deg, a0)
+    return np.array([v[0], v[1], a[0], a[1]], dtype=float)
+
+def rk4_step(state: np.ndarray, beta_deg: float, a0: float, dt: float) -> np.ndarray:
+    k1 = f(state, beta_deg, a0)
+    k2 = f(state + 0.5 * dt * k1, beta_deg, a0)
+    k3 = f(state + 0.5 * dt * k2, beta_deg, a0)
+    k4 = f(state + dt * k3, beta_deg, a0)
+    return state + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
 
-def power_from_error(err: float) -> float:
-    return clamp(math.cos(err), 0.0, 1.0)
+# -----------------------------
+# Planets (analytic circles)
+# -----------------------------
+def planet_pos(r: float, n: float, t_yr: float, phase_rad: float) -> np.ndarray:
+    ang = n * t_yr + phase_rad
+    return np.array([r * math.cos(ang), r * math.sin(ang)], dtype=float)
 
+
+# -----------------------------
+# Game state
+# -----------------------------
+@dataclass
+class GameConfig:
+    dt_days: float
+    a0: float
+    venus_phase_deg: float
+    time_limit_days: float
+    time_unlimited: bool
 
 @dataclass
-class Params:
-    dt: float = 0.1
-    mass: float = 1.0
-    inertia: float = 0.35
-    damping: float = 0.55
-    F0: float = 0.17
-    T0: float = 0.55
+class GameState:
+    t_yr: float
+    sc: np.ndarray  # [x,y,vx,vy]
+    beta_deg: float
+    auto: bool
+    done: bool
+    message: str
+    best_dist: float
 
+def init_game(cfg: GameConfig) -> GameState:
+    # Spacecraft starts at Earth's position with Earth's circular velocity (prograde CCW)
+    r0 = planet_pos(R_E, N_E, 0.0, 0.0)
+    v0 = np.array([-R_E * N_E * math.sin(0.0), R_E * N_E * math.cos(0.0)], dtype=float)
+    sc = np.array([r0[0], r0[1], v0[0], v0[1]], dtype=float)
 
-@dataclass
-class State:
-    t: float
-    theta: float
-    omega: float
-    pos: np.ndarray
-    vel: np.ndarray
-    score: float
-    battery: float  # 0..1
-    stable: float   # 0..1
-    reached: int
-    last_err_sign: int
-    flips: int
-
-
-def init_state() -> State:
-    return State(
-        t=0.0,
-        theta=rad(25.0),
-        omega=0.0,
-        pos=np.array([0.0, 0.0], dtype=float),
-        vel=np.array([0.0, 0.0], dtype=float),
-        score=0.0,
-        battery=0.0,
-        stable=0.0,
-        reached=0,
-        last_err_sign=0,
-        flips=0,
+    return GameState(
+        t_yr=0.0,
+        sc=sc,
+        beta_deg=-35.0,   # a good starting hint for Earth->Venus
+        auto=True,
+        done=False,
+        message="",
+        best_dist=1e9,
     )
 
 
-def control_from_handle(handle: float, base: float = 0.65, k: float = 0.35) -> np.ndarray:
-    h = clamp(handle / 100.0, -1.0, 1.0)
-    L = clamp(base + k * h, 0.0, 1.0)
-    R = clamp(base - k * h, 0.0, 1.0)
-    Fp = clamp(base * 0.15, 0.0, 1.0)
-    B = 0.0
-    return np.array([L, R, Fp, B], dtype=float)
+# -----------------------------
+# UI text helpers
+# -----------------------------
+def beta_label(beta_deg: float) -> str:
+    if beta_deg < -1e-6:
+        return "減速（内側へ）"
+    if beta_deg > 1e-6:
+        return "加速（外側へ）"
+    return "まっすぐ（待ち）"
+
+def traffic_light(dist_trend: float, dist: float) -> Tuple[str, str]:
+    """Return (color_name, text)."""
+    # dist_trend: negative => approaching
+    if dist <= VENUS_HIT_RADIUS * 1.4:
+        return ("green", "かなり近い！そのまま！")
+    if dist_trend < -1e-4:
+        return ("green", "近づいてる（いい！）")
+    if abs(dist_trend) <= 1e-4:
+        return ("yellow", "あまり変わらない（βを変える？）")
+    return ("red", "遠ざかってる（βの符号を疑え）")
 
 
-def step(state: State, panels: np.ndarray, sun_dir: float, disturbance: float, params: Params) -> Dict[str, float]:
-    dt = params.dt
-    panels = np.clip(panels, 0.0, 1.0)
+# -----------------------------
+# Streamlit app
+# -----------------------------
+st.set_page_config(page_title="IKAROS β-GO!", layout="wide")
+st.title("☀️ IKAROS β-GO!（2D・角度1本）")
+st.caption("軌道は自動で進む。あなたは“帆のβ角”だけで、地球から金星へ近づけ！")
 
-    err = wrap_pi(sun_dir - state.theta)
+# Controls (top)
+c1, c2, c3 = st.columns([1.2, 1.0, 1.1])
 
-    # sign flips (overshoot)
-    sign = 0
-    if err > 1e-6:
-        sign = 1
-    elif err < -1e-6:
-        sign = -1
-    if state.last_err_sign != 0 and sign != 0 and sign != state.last_err_sign:
-        state.flips += 1
-    if sign != 0:
-        state.last_err_sign = sign
+with c1:
+    mode = st.radio("モード", ["リアルタイム制御", "事前角度指定"], horizontal=True)
 
-    alpha = err
-    mean_r = float(np.mean(panels))
+with c2:
+    time_unlimited = st.toggle("エクストラ：時間無制限", value=False)
+    show_teacher = st.toggle("先生モード（詳細）", value=False)
 
-    F = params.F0 * mean_r * max(math.cos(alpha), 0.0)
-    L, R, Fp, B = float(panels[0]), float(panels[1]), float(panels[2]), float(panels[3])
-    tau = params.T0 * ((R - L) * math.cos(alpha) + (Fp - B) * math.sin(alpha))
-    tau += disturbance * (0.6 * math.sin(0.18 * state.t) + 0.4 * math.cos(0.11 * state.t))
+with c3:
+    st.markdown("**勝ち**：金星までの距離が小さくなるほど良い。十分近づいたらクリア！")
+    st.markdown(f"- クリア距離：{VENUS_HIT_RADIUS:.3f} AU（おおよそ）")
 
-    state.omega += (tau / params.inertia - params.damping * state.omega) * dt
-    state.theta = wrap_pi(state.theta + state.omega * dt)
+# Config
+dt_days = DT_DAYS_DEFAULT
+a0 = A0_DEFAULT
+venus_phase_deg = 60.0
+time_limit_days = 220.0
 
-    acc = (F / params.mass) * vec(state.theta)
-    state.vel = state.vel + acc * dt
-    state.pos = state.pos + state.vel * dt
+if show_teacher:
+    with st.expander("先生モード：難易度調整", expanded=False):
+        dt_days = st.slider("刻み（days）", 0.2, 2.0, float(dt_days), 0.1)
+        a0 = st.slider("帆の強さ（toy）", 0.005, 0.08, float(a0), 0.001)
+        venus_phase_deg = st.slider("金星の初期位相（deg）", 0.0, 180.0, float(venus_phase_deg), 1.0)
+        time_limit_days = st.slider("制限時間（days）", 60.0, 500.0, float(time_limit_days), 5.0)
 
-    pwr = power_from_error(err)
-    state.score += (8.0 * pwr - 1.0 * abs(err) - 0.25 * abs(state.omega) - 0.25 * float(np.sum(panels))) * dt
+cfg = GameConfig(
+    dt_days=float(dt_days),
+    a0=float(a0),
+    venus_phase_deg=float(venus_phase_deg),
+    time_limit_days=float(time_limit_days),
+    time_unlimited=bool(time_unlimited),
+)
 
-    state.t += dt
-
-    return dict(
-        t=state.t,
-        err=err,
-        omega=state.omega,
-        power=pwr,
-        pos_x=float(state.pos[0]), pos_y=float(state.pos[1]),
-        score=float(state.score),
-        flips=float(state.flips),
-        L=L, R=R, Fp=Fp, B=B,
-    )
-
-
-STAGES = {
-    1: dict(
-        name="Stage 1：太陽を向け！",
-        time_limit=45.0,
-        target_battery=1.0,
-        noise_deg=0.0,
-        disturbance=0.0,
-        target=None,
-        rules="電力ゲージを満タン（太陽に向くほど増える）",
-    ),
-    2: dict(
-        name="Stage 2：ゆらゆらでも安定",
-        time_limit=50.0,
-        target_battery=1.0,
-        noise_deg=6.0,
-        disturbance=0.0,
-        target=None,
-        rules="安定ゲージを満タン（ズレ小＆回転小で増える）",
-    ),
-    3: dict(
-        name="Stage 3：目的地へ！",
-        time_limit=60.0,
-        target_battery=0.65,
-        noise_deg=3.0,
-        disturbance=0.25,
-        target=np.array([4.5, 1.2], dtype=float),
-        rules="目的地に到達（少しズラして進む）",
-    ),
-}
-
-
-def title_rank(score: float) -> str:
-    if score >= 260:
-        return "伝説の帆船管制官"
-    if score >= 210:
-        return "エース操縦士"
-    if score >= 160:
-        return "いい感じの船乗り"
-    if score >= 110:
-        return "見習い操縦士"
-    return "はじめての帆船"
-
-
-st.set_page_config(page_title="IKAROS GO!", layout="wide")
-st.title("☀️ IKAROS GO!（超シンプル版）")
-st.caption("1）ハンドルで曲げる　2）太陽マークに向ける　3）ゲージを満たしてクリア！")
-
-colA, colB = st.columns([1.15, 0.85], gap="large")
-
-with st.sidebar:
-    st.header("ステージ")
-    stage = st.radio("選ぶ", [1, 2, 3], format_func=lambda i: STAGES[i]["name"], index=0)
-    st.divider()
-    teacher = st.toggle("先生モード（詳細設定）", value=False)
-
-# Session init
-if "state" not in st.session_state:
-    st.session_state.state = init_state()
+# Session init/reset
+if "game_cfg" not in st.session_state:
+    st.session_state.game_cfg = cfg
+    st.session_state.game = init_game(cfg)
     st.session_state.telemetry = []
-    st.session_state.sun_dir = 0.0
-    st.session_state.params = Params()
-    st.session_state.stage = stage
+    st.session_state.prev_dist = None
+else:
+    # If cfg changed materially, keep current run unless user resets (teacher can tweak mid-run)
+    st.session_state.game_cfg = cfg
 
-if st.session_state.stage != stage:
-    st.session_state.state = init_state()
+# Buttons row
+bcol1, bcol2, bcol3, bcol4, bcol5 = st.columns([1, 1, 1, 1, 1])
+
+def reset_run():
+    st.session_state.game = init_game(cfg)
     st.session_state.telemetry = []
-    st.session_state.stage = stage
+    st.session_state.prev_dist = None
 
-S = STAGES[stage]
-params: Params = st.session_state.params
+with bcol1:
+    if st.button("🔁 リセット", use_container_width=True):
+        reset_run()
 
-noise_deg = float(S["noise_deg"])
-disturbance = float(S["disturbance"])
-time_limit = float(S["time_limit"])
+game: GameState = st.session_state.game
 
-with st.sidebar:
-    if teacher:
-        st.subheader("難しさ（先生用）")
-        noise_deg = st.slider("センサーゆらぎ（度）", 0.0, 12.0, noise_deg, 0.5)
-        disturbance = st.slider("外乱（回される）", 0.0, 1.0, disturbance, 0.05)
-        time_limit = st.slider("制限時間（秒）", 20.0, 120.0, time_limit, 5.0)
+# Beta adjust controls
+def bump_beta(delta: float):
+    game.beta_deg = float(clamp(game.beta_deg + delta, -75.0, 75.0))
 
-    st.divider()
-    st.header("操作")
-    handle = st.slider("ハンドル（左← →右）", -100, 100, 0, 1)
-    advance = st.radio("すすめる量", ["ちょっと（0.5秒）", "ふつう（1秒）", "まとめて（5秒）"], index=1)
-    step_btn = st.button("▶️ すすめる", use_container_width=True)
-    reset_btn = st.button("🔁 リセット", use_container_width=True)
+with bcol2:
+    if st.button("⬅ β -5°", use_container_width=True):
+        bump_beta(-5.0)
+with bcol3:
+    if st.button("➡ β +5°", use_container_width=True):
+        bump_beta(+5.0)
+with bcol4:
+    if st.button("⏸/▶ 自動進行", use_container_width=True):
+        game.auto = not game.auto
 
-if reset_btn:
-    st.session_state.state = init_state()
-    st.session_state.telemetry = []
-    st.rerun()
-
-def advance_steps() -> int:
-    if advance.startswith("ちょっと"):
-        return int(0.5 / params.dt)
-    if advance.startswith("ふつう"):
-        return int(1.0 / params.dt)
-    return int(5.0 / params.dt)
-
-def sense_err_omega(state: State) -> Tuple[float, float]:
-    err = wrap_pi(st.session_state.sun_dir - state.theta)
-    e_noisy = rad(deg(err) + np.random.normal(0.0, noise_deg))
-    w_noisy = state.omega + rad(np.random.normal(0.0, noise_deg * 0.2))
-    return e_noisy, w_noisy
-
-def update_progress(state: State, err_true: float, power: float):
-    if stage == 1:
-        gain = 0.75 * power
-        drain = 0.12 * abs(err_true)
-        state.battery = clamp(state.battery + (gain - drain) * params.dt, 0.0, 1.0)
-    elif stage == 2:
-        ok_err = abs(deg(err_true)) <= 8.0
-        ok_w = abs(deg(state.omega)) <= 18.0
-        gain = 0.9 if (ok_err and ok_w) else 0.0
-        drain = 0.25 if (not ok_err or not ok_w) else 0.0
-        state.stable = clamp(state.stable + (gain - drain) * params.dt, 0.0, 1.0)
-
-def check_clear(state: State) -> Tuple[bool, str]:
-    if stage == 1:
-        if state.battery >= S["target_battery"]:
-            return True, "電力ゲージ満タン！太陽に勝った（？）"
-        return False, ""
-    if stage == 2:
-        if state.stable >= 1.0:
-            return True, "安定ゲージ満タン！いい操縦〜！"
-        return False, ""
-    target = S["target"]
-    if target is not None:
-        if float(np.linalg.norm(state.pos - target)) < 0.35:
-            err = wrap_pi(st.session_state.sun_dir - state.theta)
-            if power_from_error(err) >= S["target_battery"]:
-                state.reached = 1
-                return True, "目的地到達！しかも発電もキープ！"
-            return False, "着いたけど…太陽から背を向けすぎ！ちょい修正。"
-    return False, ""
-
-if step_btn:
-    n = advance_steps()
-    for _ in range(n):
-        if st.session_state.state.t >= time_limit:
-            break
-
-        state: State = st.session_state.state
-        e_noisy, w_noisy = sense_err_omega(state)  # reserved for future, logged in teacher mode
-
-        panels = control_from_handle(handle)
-        telem = step(state, panels, st.session_state.sun_dir, disturbance, params)
-
-        update_progress(state, telem["err"], telem["power"])
-
-        if teacher:
-            telem["e_noisy_deg"] = deg(e_noisy)
-            telem["w_noisy_deg_s"] = deg(w_noisy)
-        st.session_state.telemetry.append(telem)
-
-        cleared, _ = check_clear(state)
-        if cleared:
-            break
-
-state: State = st.session_state.state
-err_true = wrap_pi(st.session_state.sun_dir - state.theta)
-pwr = power_from_error(err_true)
-
-with colA:
-    st.subheader(S["rules"])
-
-    g1, g2, g3 = st.columns([1, 1, 1])
-    g1.metric("時間", f"{state.t:.1f}/{time_limit:.0f} s")
-    g2.metric("太陽ズレ", f"{deg(err_true):.1f}°")
-    g3.metric("電力", f"{pwr:.2f}")
-
-    if stage == 1:
-        st.progress(state.battery, text=f"電力ゲージ：{int(state.battery*100)}%")
-    elif stage == 2:
-        st.progress(state.stable, text=f"安定ゲージ：{int(state.stable*100)}%")
+with bcol5:
+    # quick presets
+    preset = st.selectbox("ワンタッチβ", ["-35°（内側へ）", "0°（待ち）", "+35°（外側へ）"], index=0)
+    if preset.startswith("-35"):
+        game.beta_deg = -35.0
+    elif preset.startswith("0"):
+        game.beta_deg = 0.0
     else:
-        tgt = S["target"]
-        dist = float(np.linalg.norm(state.pos - tgt)) if tgt is not None else 0.0
-        st.progress(clamp(1.0 - dist / 5.0, 0.0, 1.0), text=f"目的地まで：{dist:.2f}")
+        game.beta_deg = 35.0
 
+# Show current beta big
+st.markdown(
+    f"## β = **{game.beta_deg:+.0f}°**  —  {beta_label(game.beta_deg)}"
+)
+
+# Pre-plan mode UI
+plan: List[Tuple[float, float]] = []  # (beta_deg, duration_days)
+run_plan = False
+if mode == "事前角度指定":
+    st.info("βを3区間だけ決めて、一気に実行します（HTV GO!!の“事前計画”っぽい遊び）。")
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        b1 = st.slider("区間1 β（deg）", -75, 75, -35, 1)
+        d1 = st.slider("区間1 日数", 10, 200, 70, 1)
+    with p2:
+        b2 = st.slider("区間2 β（deg）", -75, 75, 0, 1)
+        d2 = st.slider("区間2 日数", 0, 200, 30, 1)
+    with p3:
+        b3 = st.slider("区間3 β（deg）", -75, 75, -20, 1)
+        d3 = st.slider("区間3 日数", 0, 250, 90, 1)
+    plan = [(float(b1), float(d1)), (float(b2), float(d2)), (float(b3), float(d3))]
+    run_plan = st.button("⏩ 計画を実行（最初から）", use_container_width=True)
+
+# Simulation step function
+def step_n(n_steps: int, beta_deg: float):
+    if game.done:
+        return
+    dt = (cfg.dt_days / 365.25)
+
+    for _ in range(n_steps):
+        # time limit
+        days = game.t_yr * 365.25
+        if (not cfg.time_unlimited) and (days >= cfg.time_limit_days):
+            game.done = True
+            game.message = "時間切れ！でもエクストラ（時間無制限）で続けられる。"
+            break
+
+        # integrate spacecraft
+        game.sc = rk4_step(game.sc, beta_deg=beta_deg, a0=cfg.a0, dt=dt)
+        game.t_yr += dt
+
+        # telemetry (downsample to keep light)
+        if len(st.session_state.telemetry) < 6000:
+            st.session_state.telemetry.append((game.t_yr, game.sc.copy(), beta_deg))
+
+        # check win
+        r_sc = game.sc[:2]
+        r_v = planet_pos(R_V, N_V, game.t_yr, rad(cfg.venus_phase_deg))
+        dist = norm(r_sc - r_v)
+        game.best_dist = min(game.best_dist, dist)
+        if dist <= VENUS_HIT_RADIUS:
+            game.done = True
+            game.message = "金星に十分近づいた！ミッション成功！"
+            break
+
+# Execute plan
+if run_plan:
+    reset_run()
+    # Run through the plan
+    for (b, d_days) in plan:
+        if d_days <= 0:
+            continue
+        steps = int(max(1, round(d_days / cfg.dt_days)))
+        step_n(steps, beta_deg=b)
+        if game.done:
+            break
+
+# Real-time auto advance (or manual nudge)
+# In real-time mode, 'auto' advances using autorefresh.
+tick_steps = 3  # per refresh
+if mode == "リアルタイム制御":
+    if game.auto and (not game.done):
+        # autorefresh drives reruns
+        st_autorefresh = st.experimental_data_editor  # placeholder to avoid import confusion (not used)
+
+        # Streamlit's native autorefresh is in st_autorefresh (streamlit>=1.25+).
+        # We'll call it if available, else fall back to manual stepping.
+        try:
+            from streamlit_autorefresh import st_autorefresh as _st_autorefresh  # optional package
+            _st_autorefresh(interval=350, key="tick")
+            step_n(tick_steps, beta_deg=game.beta_deg)
+        except Exception:
+            # No extra dependency; use built-in st.experimental_rerun with a soft hint:
+            # We do a small step per run when user presses buttons.
+            pass
+
+# Manual single nudge (works even without autorefresh)
+if mode == "リアルタイム制御":
+    nudge = st.button("▶ ちょっと進める（約3日）", use_container_width=True)
+    if nudge and (not game.done):
+        steps = int(max(1, round(3.0 / cfg.dt_days)))
+        step_n(steps, beta_deg=game.beta_deg)
+
+# Compute metrics for UI
+t_days = game.t_yr * 365.25
+r_sc = game.sc[:2]
+r_e = planet_pos(R_E, N_E, game.t_yr, 0.0)
+r_v = planet_pos(R_V, N_V, game.t_yr, rad(cfg.venus_phase_deg))
+dist_v = norm(r_sc - r_v)
+
+prev = st.session_state.prev_dist
+dist_trend = 0.0 if prev is None else (dist_v - prev)
+st.session_state.prev_dist = dist_v
+
+color, advice = traffic_light(dist_trend, dist_v)
+
+# Top HUD
+h1, h2, h3, h4 = st.columns(4)
+h1.metric("経過日数", f"{t_days:.0f} d")
+if cfg.time_unlimited:
+    h2.metric("残り時間", "∞")
+else:
+    h2.metric("残り時間", f"{max(0.0, cfg.time_limit_days - t_days):.0f} d")
+h3.metric("金星まで距離", f"{dist_v:.3f} AU")
+h4.metric("ベスト距離", f"{game.best_dist:.3f} AU")
+
+# Traffic light render (simple, color-free for robustness)
+if color == "green":
+    st.success(f"● 緑  {advice}")
+elif color == "yellow":
+    st.warning(f"● 黄  {advice}")
+else:
+    st.error(f"● 赤  {advice}")
+
+# Main plot
+left, right = st.columns([1.35, 0.9], gap="large")
+
+with left:
     fig = plt.figure()
     ax = fig.add_subplot(111)
     ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
+    ax.set_xlabel("x (AU)")
+    ax.set_ylabel("y (AU)")
 
+    # Orbits (circles)
+    th = np.linspace(0, 2*math.pi, 400)
+    ax.plot(R_E * np.cos(th), R_E * np.sin(th), linewidth=1)
+    ax.plot(R_V * np.cos(th), R_V * np.sin(th), linewidth=1)
+
+    # Trajectory
     if st.session_state.telemetry:
-        xs = [t["pos_x"] for t in st.session_state.telemetry]
-        ys = [t["pos_y"] for t in st.session_state.telemetry]
-        ax.plot(xs, ys, linewidth=2)
+        traj = np.array([s[:2] for (_, s, _) in st.session_state.telemetry], dtype=float)
+        ax.plot(traj[:, 0], traj[:, 1], linewidth=2)
 
-    p = state.pos
-    fwd = vec(state.theta)
-    ax.arrow(p[0], p[1], 0.35 * fwd[0], 0.35 * fwd[1], head_width=0.12, length_includes_head=True)
+    # Bodies
+    ax.scatter([0.0], [0.0], marker="o")  # Sun
+    ax.text(0.02, 0.02, "Sun", fontsize=10)
 
-    sun_vec = vec(st.session_state.sun_dir)
-    ax.arrow(p[0], p[1], 0.45 * sun_vec[0], 0.45 * sun_vec[1], head_width=0.10, length_includes_head=True)
+    ax.scatter([r_e[0]], [r_e[1]], marker="o")
+    ax.text(r_e[0] + 0.02, r_e[1] + 0.02, "Earth", fontsize=10)
 
-    if stage == 3 and S["target"] is not None:
-        tgt = S["target"]
-        ax.scatter([tgt[0]], [tgt[1]], marker="o")
-        ax.text(tgt[0] + 0.05, tgt[1] + 0.05, "GOAL", fontsize=11)
+    ax.scatter([r_v[0]], [r_v[1]], marker="o")
+    ax.text(r_v[0] + 0.02, r_v[1] + 0.02, "Venus", fontsize=10)
 
-    if st.session_state.telemetry:
-        xs = np.array([t["pos_x"] for t in st.session_state.telemetry] + [p[0]])
-        ys = np.array([t["pos_y"] for t in st.session_state.telemetry] + [p[1]])
-        x_min, x_max = float(xs.min()), float(xs.max())
-        y_min, y_max = float(ys.min()), float(ys.max())
-        pad = 0.9
-        ax.set_xlim(x_min - pad, x_max + pad)
-        ax.set_ylim(y_min - pad, y_max + pad)
-    else:
-        ax.set_xlim(-1.5, 3.5)
-        ax.set_ylim(-1.5, 2.5)
+    ax.scatter([r_sc[0]], [r_sc[1]], marker="x")
+    ax.text(r_sc[0] + 0.02, r_sc[1] + 0.02, "Sail", fontsize=10)
+
+    # Sail acceleration arrow (hint)
+    a_vec = sail_accel(r_sc, game.beta_deg, cfg.a0)
+    a_hat = unit(a_vec)
+    ax.arrow(r_sc[0], r_sc[1], 0.12 * a_hat[0], 0.12 * a_hat[1], head_width=0.03, length_includes_head=True)
+
+    # View limits
+    lim = 1.35
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
 
     st.pyplot(fig, use_container_width=True)
 
-    cleared, msg = check_clear(state)
-    if cleared:
-        st.success(msg)
-        st.balloons()
-        st.markdown(f"**称号：{title_rank(state.score)}**")
-    elif state.t >= time_limit:
-        st.error("時間切れ！もう一回！")
-        st.markdown(f"称号：{title_rank(state.score)}")
-
-with colB:
+with right:
     st.subheader("遊び方（これだけ）")
     st.markdown(
         """
-- **ハンドル**を動かすと、帆が左右に“じわっ”と回る  
-- **太陽マーク（矢印）**の方向に向けると電力が増える  
-- Stage3は **少しズラして進む**（でもズラしすぎると電力が落ちる）
+- **β<0** にすると、進行方向と反対に押して **減速** → 内側（＝金星側）へ行きやすい  
+- **β=0** は “待ち”（大きく変えたくない時）  
+- **β>0** は **加速** → 外側へ行きやすい  
 """
     )
+    st.markdown("**コツ（最短の説明）**")
+    st.info("まず β=-35° で内側へ。すれ違いそうなら β=0° で“待ち”を入れてタイミング調整。")
 
     st.divider()
-    st.markdown("**いまのコツ**")
-    if stage == 1:
-        st.info("ズレが小さくなったらハンドルを0へ。チョン操作が強い。")
-    elif stage == 2:
-        st.info("ノイズでフラつく。反応しすぎず、ゆっくり戻す。")
-    else:
-        st.info("目的地へ向けて少しズラす。でも電力0.65未満だと“失速”。")
-
-    if teacher:
-        st.divider()
-        st.subheader("ログ（先生モード）")
-        if st.session_state.telemetry:
-            with st.expander("角度ズレ・角速度（グラフ）", expanded=False):
-                t = np.array([x["t"] for x in st.session_state.telemetry], dtype=float)
-                e = np.degrees(np.array([x["err"] for x in st.session_state.telemetry], dtype=float))
-                w = np.degrees(np.array([x["omega"] for x in st.session_state.telemetry], dtype=float))
-
-                fig1 = plt.figure()
-                ax1 = fig1.add_subplot(111)
-                ax1.set_xlabel("t (s)")
-                ax1.set_ylabel("error (deg)")
-                ax1.plot(t, e)
-                st.pyplot(fig1, use_container_width=True)
-
-                fig2 = plt.figure()
-                ax2 = fig2.add_subplot(111)
-                ax2.set_xlabel("t (s)")
-                ax2.set_ylabel("omega (deg/s)")
-                ax2.plot(t, w)
-                st.pyplot(fig2, use_container_width=True)
-
-            with st.expander("表（最後の100行）", expanded=False):
-                st.dataframe(st.session_state.telemetry[-100:], use_container_width=True)
+    if game.done:
+        if "成功" in game.message:
+            st.success(game.message)
+            st.balloons()
         else:
-            st.caption("まだログがありません。")
+            st.error(game.message)
 
-st.caption("※ これは教材用の簡略モデルです（実機の正確な物理モデルではありません）。")
+    st.caption("※ 本モデルは教材用の簡略化です（実機の精密な航法・姿勢・光圧モデルではありません）。")
+
+    if show_teacher and st.session_state.telemetry:
+        with st.expander("先生モード：簡易ログ（最後の200点）", expanded=False):
+            rows = []
+            for (t, s, b) in st.session_state.telemetry[-200:]:
+                rv = planet_pos(R_V, N_V, t, rad(cfg.venus_phase_deg))
+                rows.append(
+                    dict(
+                        day=t*365.25,
+                        x=float(s[0]), y=float(s[1]),
+                        vx=float(s[2]), vy=float(s[3]),
+                        beta=float(b),
+                        dist_venus=float(norm(s[:2]-rv)),
+                    )
+                )
+            st.dataframe(rows, use_container_width=True)
