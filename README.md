@@ -1,14 +1,14 @@
-# IKAROS：B-plane ダーツ（適応誘導オペレーション） v4
+# IKAROS：B-plane ダーツ v5
 
-v3で発生した Altair の SchemaValidationError を回避するため、**Altairを廃止**し、
-`st.vega_lite_chart()` に **Vega-Lite の dict spec を直接渡す**構成に変更しました。
+v4の「上のグラフが潰れる」「ゲーム性が薄い」を受けて、運用の本質を“制約”として追加した版。
+
+## 追加した要素
+- **電力**：βを振ると発電が落ちる（抽象）→ バッテリが減ると通信ができない/OD品質が落ちる
+- **地球角 / 通信ウィンドウ**：βを振ると地球角が悪化（抽象）→ 通信NGだと **Δβ=0固定**
+- **データ（科学）**：ターンごとにデータが溜まる。通信できるターンでしか下ろせない。バッファ溢れは損失
 
 ## 実行
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-## 変更点
-- ✅ すべてのグラフを Vega-Lite（dict spec）で描画
-- ✅ Python 3.13 dataclass の mutable default 問題を修正済み
