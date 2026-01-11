@@ -126,7 +126,7 @@ def render_play():
     with a2:
         st.metric("α（太陽）", f"{alpha:.1f}°")
     with a3:
-        st.metric("γ（地球）", f"{gamma:.1f}°")
+        st.metric("γ（地球・両面）", f"{gamma:.1f}°")
     with a4:
         st.metric("発電Pgen", f"{Pgen:.1f}")
     with a5:
@@ -215,8 +215,22 @@ def render_result():
 
     if state.log:
         df = pd.DataFrame(state.log)
-        st.subheader("推移まとめ")
-        st.line_chart(df.set_index("turn")[["dist_to_target_km", "energy", "alpha_sun_deg", "gamma_earth_deg", "data_buffer", "data_lost_total"]], height=300)
+        st.subheader("推移まとめ（項目別）")
+        cA, cB = st.columns(2)
+        with cA:
+            st.caption("距離：ターゲットからのズレ")
+            st.line_chart(df.set_index("turn")[["dist_to_target_km"]], height=170)
+            st.caption("バッテリ残量")
+            st.line_chart(df.set_index("turn")[["energy"]], height=170)
+            st.caption("通信指向（γ：両面最小角）")
+            st.line_chart(df.set_index("turn")[["gamma_earth_deg"]], height=170)
+        with cB:
+            st.caption("太陽指向（α）")
+            st.line_chart(df.set_index("turn")[["alpha_sun_deg"]], height=170)
+            st.caption("データ：バッファ量")
+            st.line_chart(df.set_index("turn")[["data_buffer"]], height=170)
+            st.caption("データ：損失（累積）")
+            st.line_chart(df.set_index("turn")[["data_lost_total"]], height=170)
 
     if st.button("🔁 もう一回（リセット）", use_container_width=True):
         reset()

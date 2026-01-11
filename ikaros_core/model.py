@@ -21,6 +21,7 @@ import numpy as np
 from .config import GameConfig, EphemConfig
 from .attitude import (
     angle_deg,
+    angle_bisided_deg,
     comm_ok_from_gamma,
     compute_dirs,
     downlink_rate_from_gamma,
@@ -207,8 +208,9 @@ def alpha_gamma_deg(beta_in: float, beta_out: float, state: GameState, cfg: Game
     s_hat, e_hat = compute_dirs(r_sc, r_e)
     n_hat = sail_normal_from_beta(beta_in, beta_out, s_hat)
     alpha = angle_deg(n_hat, s_hat)
-    gamma = angle_deg(n_hat, e_hat)
-    return alpha, gamma
+    # IKAROSはアンテナが表裏両面にある想定：地球との角度は“両面”最小角
+    gamma_eff = angle_bisided_deg(n_hat, e_hat)
+    return alpha, gamma_eff
 
 
 def comm_ok(beta_in: float, beta_out: float, state: GameState, cfg: GameConfig, sections: List[Section]) -> bool:

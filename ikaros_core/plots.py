@@ -25,7 +25,8 @@ from .model import (
     current_positions, comm_ok,
 )
 from .attitude import (
-    unit, compute_dirs, sail_normal_from_beta, angle_deg,
+    unit,
+    angle_bisided_deg, compute_dirs, sail_normal_from_beta, angle_deg,
     downlink_rate_from_gamma, power_from_alpha,
 )
 
@@ -190,13 +191,14 @@ def plot_orbits_2d_nominal(state: GameState, cfg: GameConfig, sections: List[Sec
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
 
-    leg = ax.legend(loc="lower left", frameon=True, fontsize=10)
+    leg = ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True, fontsize=10)
     leg.get_frame().set_facecolor("#0b1220")
     leg.get_frame().set_alpha(0.85)
     for text in leg.get_texts():
         text.set_color("white")
 
-    plt.tight_layout()
+    # 右側に凡例を出す分、余白を確保
+    plt.tight_layout(rect=[0, 0, 0.82, 1])
     return fig
 
 
@@ -224,7 +226,7 @@ def beta_map_grids(state: GameState, cfg: GameConfig, sections: List[Section], s
 
             n_hat = sail_normal_from_beta(bi, bo, s_hat)
             alpha = angle_deg(n_hat, s_hat)
-            gamma = angle_deg(n_hat, e_hat)
+            gamma = angle_bisided_deg(n_hat, e_hat)  # アンテナ表裏を考慮した最小角
 
             Pgen = power_from_alpha(alpha, cfg.gen_scale, cfg.gen_cos_k)
 
@@ -291,7 +293,7 @@ def geometry_3d_figure(state: GameState, cfg: GameConfig, sections: List[Section
     n_hat = sail_normal_from_beta(state.beta_in, state.beta_out, s_hat)
 
     alpha = angle_deg(n_hat, s_hat)
-    gamma = angle_deg(n_hat, e_hat)
+    gamma = angle_bisided_deg(n_hat, e_hat)  # アンテナ表裏を考慮した最小角
 
     def vec_trace(vec, name, color):
         return go.Scatter3d(x=[0, vec[0]], y=[0, vec[1]], z=[0, vec[2]], mode="lines",
@@ -314,7 +316,8 @@ def geometry_3d_figure(state: GameState, cfg: GameConfig, sections: List[Section
     fig = go.Figure()
     fig.add_trace(vec_trace(s_hat, "太陽方向 s", "#ffcc00"))
     fig.add_trace(vec_trace(e_hat, "地球方向 e", "#9cff57"))
-    fig.add_trace(vec_trace(n_hat, "帆法線 n", "#00d1ff"))
+    fig.add_trace(vec_trace(n_hat, "帆法線 n（表）", "#00d1ff"))
+    fig.add_trace(vec_trace(-n_hat, "帆法線 -n（裏）", "#00d1ff"))
     fig.add_trace(go.Scatter3d(x=corners[:, 0], y=corners[:, 1], z=corners[:, 2], mode="lines",
                                line=dict(width=5, color="white"), name="帆（平面）"))
     fig.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode="markers+text",
@@ -325,7 +328,7 @@ def geometry_3d_figure(state: GameState, cfg: GameConfig, sections: List[Section
 
     fig.update_layout(
         margin=dict(l=0, r=0, t=30, b=0),
-        title=f"幾何（3D概念図）  α(太陽)={alpha:.1f}°, γ(地球)={gamma:.1f}°, 通信={'OK' if ok else 'NG'}",
+        title=f"幾何（3D概念図）  α(太陽)={alpha:.1f}°, γmin(地球)={gamma:.1f}°（表{gamma_front:.1f}/裏{gamma_back:.1f}）  通信={'OK' if ok else 'NG'}",
         scene=dict(
             xaxis=dict(title="X", showbackground=False, color="white"),
             yaxis=dict(title="Y", showbackground=False, color="white"),

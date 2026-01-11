@@ -29,6 +29,20 @@ def angle_deg(u: np.ndarray, v: np.ndarray) -> float:
     return float(np.degrees(np.arccos(c)))
 
 
+
+
+def angle_bisided_deg(u: np.ndarray, v: np.ndarray) -> float:
+    """2ベクトルの“両面”なす角（deg）。
+
+    アンテナが表裏どちらにもある、という前提で
+      gamma = min(angle(u,v), angle(-u,v))
+    を使いたいときに用います。
+
+    数式的には arccos(|u·v|) と等価です。
+    """
+    c = float(np.clip(abs(np.dot(u, v)), -1.0, 1.0))
+    return float(np.degrees(np.arccos(c)))
+
 def rot_y(deg: float) -> np.ndarray:
     th = math.radians(deg)
     c, s = math.cos(th), math.sin(th)
