@@ -1,14 +1,14 @@
-# IKAROS：B-plane ダーツ（適応誘導オペレーション） v3
+# IKAROS：B-plane ダーツ（適応誘導オペレーション） v4
 
-v2で発生したエラー：
-
-- `ValueError: mutable default ... use default_factory`
-
-Python 3.13 の dataclass では `np.array(...)` のような **mutable default** が禁止なので、
-`GameConfig.target` を `default_factory` に変更して修正しています。
+v3で発生した Altair の SchemaValidationError を回避するため、**Altairを廃止**し、
+`st.vega_lite_chart()` に **Vega-Lite の dict spec を直接渡す**構成に変更しました。
 
 ## 実行
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## 変更点
+- ✅ すべてのグラフを Vega-Lite（dict spec）で描画
+- ✅ Python 3.13 dataclass の mutable default 問題を修正済み

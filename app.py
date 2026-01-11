@@ -1,7 +1,9 @@
 # IKAROS：B-plane ダーツ（適応誘導オペレーション）
-# Streamlit + Altair (Vega-Lite)
+# Streamlit + Vega-Lite (direct spec)  ✅ "全部Vega"
 #
-# v3 fix: Python 3.13 dataclasses require default_factory for mutable defaults (np.ndarray).
+# v4 fixes:
+# - Avoid Altair SchemaValidationError by using st.vega_lite_chart with explicit Vega-Lite specs.
+# - Keep Python 3.13 dataclass compatibility (default_factory for np.ndarray).
 from __future__ import annotations
 
 import math
@@ -10,9 +12,11 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import streamlit as st
-import altair as alt
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -21,6 +25,9 @@ def l2(xy: np.ndarray) -> float:
     return float(np.linalg.norm(xy))
 
 
+# -----------------------------
+# Model
+# -----------------------------
 @dataclass
 class Section:
     name: str
@@ -64,7 +71,7 @@ def build_sections() -> List[Section]:
 
 @dataclass
 class GameConfig:
-    # IMPORTANT: np.ndarray is mutable => must use default_factory on Python 3.13+
+    # Python 3.13 dataclasses require default_factory for mutable defaults
     target: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0], dtype=float))  # BT, BR [km]
 
     target_radius_early_km: float = 9000.0
@@ -171,12 +178,15 @@ def execute_section(state: GameState, cfg: GameConfig, sections: List[Section]) 
     cmd = np.array([state.beta_in, state.beta_out], dtype=float)
     dβ = cmd - plan
 
+    # NO-LINK: command locked
     if not section.comm:
         dβ = np.array([0.0, 0.0], dtype=float)
 
+    # corridor clamp
     dβ[0] = clamp(dβ[0], -section.dbeta_in_max, section.dbeta_in_max)
     dβ[1] = clamp(dβ[1], -section.dbeta_out_max, section.dbeta_out_max)
 
+    # RCS maneuvers / budget
     total_deg = abs(dβ[0]) + abs(dβ[1])
     maneuvers = section.maneuvers_per_deg * total_deg
     if maneuvers > state.maneuvers_left:
@@ -186,11 +196,15 @@ def execute_section(state: GameState, cfg: GameConfig, sections: List[Section]) 
         maneuvers = section.maneuvers_per_deg * total_deg
 
     state.maneuvers_left -= maneuvers
+
+    # RCS bias grows with maneuvers (abstract)
     rcs_bias = rng.normal(0, cfg.rcs_sigma_per_sqrt_maneuver * math.sqrt(max(maneuvers, 0.0)), size=(2,))
 
+    # Dynamics update (abstracted)
     state.B_est = state.B_est + section.S @ dβ
     state.B_true = state.B_est + section.H @ (state.p_true - state.p_est) + rcs_bias
 
+    # OD update
     y, p_est_new, P_new = od_update(state, section, cfg, rng)
     state.B_obs_last = y
     state.p_est = p_est_new
@@ -242,29 +256,42 @@ def score_game(state: GameState, cfg: GameConfig):
     }
 
 
-def alt_timeline(state: GameState, sections: List[Section]) -> alt.Chart:
+# -----------------------------
+# Vega-Lite chart builders (dict specs)
+# -----------------------------
+def vega_timeline_spec(state: GameState, sections: List[Section]) -> Dict:
     rows = []
     for i, s in enumerate(sections):
-        rows.append({"sec": i + 1, "label": s.name, "status": "現在" if i == state.k else ("完了" if i < state.k else "未")})
-    return (
-        alt.Chart(alt.Data(values=rows))
-        .mark_bar()
-        .encode(
-            x=alt.X("sec:O", title="セクション（2週間単位）"),
-            y=alt.Y("status:N", title=None),
-            color=alt.Color("status:N", legend=None),
-            tooltip=["label:N", "status:N"],
-        )
-        .properties(height=70)
-    )
+        rows.append({
+            "sec": i + 1,
+            "label": s.name,
+            "status": "現在" if i == state.k else ("完了" if i < state.k else "未"),
+            "row": "timeline"
+        })
+
+    return {
+        "data": {"values": rows},
+        "height": 40,
+        "mark": {"type": "rect"},
+        "encoding": {
+            "x": {"field": "sec", "type": "ordinal", "title": "セクション（2週間単位）"},
+            "y": {"field": "row", "type": "nominal", "axis": None, "title": None},
+            "color": {"field": "status", "type": "nominal", "legend": None},
+            "tooltip": [
+                {"field": "label", "type": "nominal"},
+                {"field": "status", "type": "nominal"},
+            ],
+        },
+        "config": {"view": {"stroke": None}},
+    }
 
 
-def alt_bplane_chart(state: GameState, cfg: GameConfig, sections: List[Section], preview_beta: Tuple[float, float], show_truth: bool) -> alt.Chart:
+def vega_bplane_spec(state: GameState, cfg: GameConfig, sections: List[Section], preview_beta: Tuple[float, float], show_truth: bool) -> Dict:
     section = sections[min(state.k, len(sections) - 1)]
     plan = np.array([cfg.plan_beta_in_deg, cfg.plan_beta_out_deg], dtype=float)
     preview = np.array(preview_beta, dtype=float)
-    dβ = preview - plan
 
+    dβ = preview - plan
     if not section.comm:
         dβ = np.array([0.0, 0.0], dtype=float)
 
@@ -280,8 +307,9 @@ def alt_bplane_chart(state: GameState, cfg: GameConfig, sections: List[Section],
     rad_BT = float(max(300.0, math.sqrt(max(CovB[0, 0], 1.0))))
     rad_BR = float(max(300.0, math.sqrt(max(CovB[1, 1], 1.0))))
 
+    # Controllability polygon centered at estimate
     poly = compute_controllability_polygon(section) + state.B_est.reshape(1, 2)
-    poly_df = [{"BT": float(p[0]), "BR": float(p[1]), "idx": i} for i, p in enumerate(poly)]
+    poly_vals = [{"BT": float(p[0]), "BR": float(p[1]), "idx": i} for i, p in enumerate(poly)]
 
     pts = [
         {"BT": float(cfg.target[0]), "BR": float(cfg.target[1]), "kind": "ターゲット中心"},
@@ -296,40 +324,73 @@ def alt_bplane_chart(state: GameState, cfg: GameConfig, sections: List[Section],
     tighten = (state.k + 1) >= cfg.target_tighten_section
     target_r = cfg.target_radius_late_km if tighten else cfg.target_radius_early_km
 
-    all_bt = [p["BT"] for p in pts] + [p["BT"] for p in poly_df]
-    all_br = [p["BR"] for p in pts] + [p["BR"] for p in poly_df]
+    ring_vals = []
+    for i in range(65):
+        th = 2 * math.pi * i / 64
+        ring_vals.append({"BT": float(cfg.target[0] + target_r * math.cos(th)),
+                          "BR": float(cfg.target[1] + target_r * math.sin(th)),
+                          "i": i})
+
+    ell_vals = []
+    for i in range(65):
+        th = 2 * math.pi * i / 64
+        ell_vals.append({"BT": float(state.B_est[0] + rad_BT * math.cos(th)),
+                         "BR": float(state.B_est[1] + rad_BR * math.sin(th)),
+                         "i": i})
+
+    # View span
+    all_bt = [p["BT"] for p in pts] + [p["BT"] for p in poly_vals]
+    all_br = [p["BR"] for p in pts] + [p["BR"] for p in poly_vals]
     span = max(12000.0, max(map(abs, all_bt + [0])), max(map(abs, all_br + [0])))
     span = float(span * 1.15)
 
-    ring = [{"BT": float(cfg.target[0] + target_r * math.cos(2 * math.pi * i / 64)),
-             "BR": float(cfg.target[1] + target_r * math.sin(2 * math.pi * i / 64)),
-             "i": i} for i in range(65)]
+    return {
+        "height": 420,
+        "encoding": {
+            "x": {"field": "BT", "type": "quantitative", "title": "BT [km]", "scale": {"domain": [-span, span]}},
+            "y": {"field": "BR", "type": "quantitative", "title": "BR [km]", "scale": {"domain": [-span, span]}},
+        },
+        "layer": [
+            {
+                "data": {"values": ring_vals},
+                "mark": {"type": "line", "opacity": 0.35},
+                "encoding": {"order": {"field": "i", "type": "quantitative"}},
+            },
+            {
+                "data": {"values": ell_vals},
+                "mark": {"type": "area", "opacity": 0.10},
+                "encoding": {"order": {"field": "i", "type": "quantitative"}},
+            },
+            {
+                "data": {"values": poly_vals},
+                "mark": {"type": "line", "opacity": 0.35},
+                "encoding": {"order": {"field": "idx", "type": "quantitative"}},
+            },
+            {
+                "data": {"values": pts},
+                "mark": {"type": "point", "filled": True, "size": 120},
+                "encoding": {
+                    "shape": {"field": "kind", "type": "nominal", "legend": {"title": ""}},
+                    "tooltip": [
+                        {"field": "kind", "type": "nominal"},
+                        {"field": "BT", "type": "quantitative", "format": ".0f"},
+                        {"field": "BR", "type": "quantitative", "format": ".0f"},
+                    ],
+                },
+            },
+            {
+                "data": {"values": pts},
+                "mark": {"type": "text", "align": "left", "dx": 8, "dy": -8},
+                "encoding": {"text": {"field": "kind", "type": "nominal"}},
+            },
+        ],
+        "config": {"axis": {"labelFontSize": 12, "titleFontSize": 12}},
+    }
 
-    ell = [{"BT": float(state.B_est[0] + rad_BT * math.cos(2 * math.pi * i / 64)),
-            "BR": float(state.B_est[1] + rad_BR * math.sin(2 * math.pi * i / 64)),
-            "i": i} for i in range(65)]
 
-    pts_df = [{"BT": p["BT"], "BR": p["BR"], "kind": p["kind"]} for p in pts]
-
-    base = alt.Chart().properties(height=420)
-    ring_layer = alt.Chart(alt.Data(values=ring)).mark_line(opacity=0.35).encode(
-        x=alt.X("BT:Q", title="BT [km]", scale=alt.Scale(domain=[-span, span])),
-        y=alt.Y("BR:Q", title="BR [km]", scale=alt.Scale(domain=[-span, span])),
-        order="i:Q",
-    )
-    ell_layer = alt.Chart(alt.Data(values=ell)).mark_area(opacity=0.10).encode(x="BT:Q", y="BR:Q", order="i:Q")
-    poly_layer = alt.Chart(alt.Data(values=poly_df)).mark_line(opacity=0.35).encode(x="BT:Q", y="BR:Q", order="idx:Q")
-    pts_layer = alt.Chart(alt.Data(values=pts_df)).mark_point(filled=True, size=120).encode(
-        x="BT:Q",
-        y="BR:Q",
-        shape=alt.Shape("kind:N", legend=alt.Legend(title="")),
-        tooltip=[alt.Tooltip("kind:N"), alt.Tooltip("BT:Q", format=".0f"), alt.Tooltip("BR:Q", format=".0f")],
-    )
-    label_layer = alt.Chart(alt.Data(values=pts_df)).mark_text(align="left", dx=8, dy=-8).encode(x="BT:Q", y="BR:Q", text="kind:N")
-
-    return (base + ring_layer + ell_layer + poly_layer + pts_layer + label_layer).configure_axis(labelFontSize=12, titleFontSize=12).configure_legend(labelFontSize=12)
-
-
+# -----------------------------
+# Streamlit UI
+# -----------------------------
 st.set_page_config(page_title="IKAROS B-plane Darts", layout="wide")
 st.title("🎯 IKAROS：B-plane ダーツ（適応誘導オペレーション）")
 st.caption("2週間=1ターン。βin/βout → ODで推定更新 → 後半勝負、を体感する“運用ゲーム”。")
@@ -354,11 +415,11 @@ with st.sidebar:
     )
 
 seed_int = int(seed)
-if "bplane_state_v3" not in st.session_state or st.session_state.get("bplane_seed_v3") != seed_int:
-    st.session_state.bplane_state_v3 = init_game(cfg, sections, seed=seed_int)
-    st.session_state.bplane_seed_v3 = seed_int
+if "bplane_state_v4" not in st.session_state or st.session_state.get("bplane_seed_v4") != seed_int:
+    st.session_state.bplane_state_v4 = init_game(cfg, sections, seed=seed_int)
+    st.session_state.bplane_seed_v4 = seed_int
 
-state: GameState = st.session_state.bplane_state_v3
+state: GameState = st.session_state.bplane_state_v4
 
 
 def rerun():
@@ -366,11 +427,12 @@ def rerun():
 
 
 def reset():
-    st.session_state.bplane_state_v3 = init_game(cfg, sections, seed=seed_int)
+    st.session_state.bplane_state_v4 = init_game(cfg, sections, seed=seed_int)
     rerun()
 
 
-st.altair_chart(alt_timeline(state, sections), use_container_width=True)
+# Timeline
+st.vega_lite_chart(vega_timeline_spec(state, sections), use_container_width=True)
 
 with st.expander("ノミナル（計画）とは？", expanded=False):
     st.markdown(
@@ -431,7 +493,7 @@ with right:
 with left:
     st.subheader("B-plane（的当て）")
     st.caption("雲=不確かさ / 四角=このセクションで動かせる範囲 / プレビュー=今の入力βを実行した場合の予測")
-    st.altair_chart(alt_bplane_chart(state, cfg, sections, (state.beta_in, state.beta_out), show_truth), use_container_width=True)
+    st.vega_lite_chart(vega_bplane_spec(state, cfg, sections, (state.beta_in, state.beta_out), show_truth), use_container_width=True)
     st.info("コツ：序盤は雲（不確かさ）が大きく、当てに行っても外れがち。ODで雲が小さくなってから後半で勝負。")
 
 st.subheader("ログ")
