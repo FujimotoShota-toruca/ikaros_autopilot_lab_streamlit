@@ -19,14 +19,14 @@ import streamlit as st
 import matplotlib
 matplotlib.use("Agg")  # Streamlit上での描画安定化
 
-from core.config import GameConfig
-from core.fonts import setup_japanese_font, default_bundled_font_path
-from core.model import (
+from ikaros_core.config import GameConfig
+from ikaros_core.fonts import setup_japanese_font, default_bundled_font_path
+from ikaros_core.model import (
     build_sections, init_game, execute_section, score_game,
     alpha_gamma_deg, comm_ok, power_gen,
     GameState,
 )
-from core.plots import plot_bplane, plot_orbits_2d_nominal, plot_beta_maps, geometry_3d_figure
+from ikaros_core.plots import plot_bplane, plot_orbits_2d_nominal, plot_beta_maps, geometry_3d_figure
 
 
 # -----------------------------
