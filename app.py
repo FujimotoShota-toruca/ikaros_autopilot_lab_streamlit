@@ -1,15 +1,13 @@
-# IKAROS：B-plane ダーツ（運用ゲーム） v10
-# - 要望対応:
-#   * 最終段階で「ノミナル（計画）軌道」が金星位置に一致するよう修正（2D軌道図）
-#   * Matplotlibの日本語文字化け対策：japanize_matplotlib を使用
-#   * コマンドの直打ち欄を削除（スライダーのみ）
-#   * メイン表示をB-planeに（B-planeを最上段・大きく）
-#   * 幾何はPlotly 3D（回せる）
-#
-# 注意：教育用の簡易モデル（実フライトダイナミクスではありません）
+# IKAROS：B-plane ダーツ（運用ゲーム） v11
+# Fixes from v10:
+# - Remove japanize_matplotlib (breaks on Python 3.13 due to distutils removal)
+# - Robust Japanese font setup using installed NotoSansCJK (if available)
+# - Restore score_game() (v10 regression)
+# - Keep: B-plane main, sliders only, nominal meets Venus at arrival, 3D geometry
 
 from __future__ import annotations
 
+import os
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -23,17 +21,67 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 from matplotlib.patches import Polygon, Circle, Ellipse
-
-import japanize_matplotlib  # noqa: F401  # enables Japanese fonts
+from matplotlib import font_manager as fm
 
 import plotly.graph_objects as go
 
 
 # -----------------------------
+# Matplotlib Japanese font setup (no extra deps)
+# -----------------------------
+def setup_matplotlib_japanese() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Try to configure a Japanese-capable font on Streamlit Cloud / Linux.
+    Prefers Noto Sans CJK JP (often preinstalled). Falls back gracefully.
+    """
+    # Known common locations (Streamlit Cloud often has NotoSansCJK*.ttc)
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansJP-Regular.otf",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        "/usr/share/fonts/truetype/ipafont-gothic/ipag.ttf",
+        "/usr/share/fonts/truetype/takao-gothic/TakaoGothic.ttf",
+    ]
+
+    # Search system fonts too (robust to different OS images)
+    try:
+        for ext in ("ttf", "otf", "ttc"):
+            for p in fm.findSystemFonts(fontpaths=None, fontext=ext):
+                base = os.path.basename(p).lower()
+                if any(k in base for k in ["notosanscjk", "notosansjp", "sourcehansans", "ipag", "ipa", "takaogothic"]):
+                    candidates.append(p)
+    except Exception:
+        pass
+
+    seen = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.exists(path):
+            try:
+                fm.fontManager.addfont(path)
+                name = fm.FontProperties(fname=path).get_name()
+                matplotlib.rcParams["font.family"] = name
+                matplotlib.rcParams["axes.unicode_minus"] = False
+                return name, path
+            except Exception:
+                continue
+
+    # Fallback (may show tofu for Japanese)
+    matplotlib.rcParams["font.family"] = "DejaVu Sans"
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return None, None
+
+
+JP_FONT_NAME, JP_FONT_PATH = setup_matplotlib_japanese()
+
+
+# -----------------------------
 # Utils
 # -----------------------------
-AU_KM = 149_597_870.7  # km
-
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -55,17 +103,13 @@ def fmt_bool(b: bool) -> str:
 # -----------------------------
 @dataclass
 class EphemConfig:
-    # angular rates (deg/day) - circular orbits
     omega_earth: float = 360.0 / 365.25
     omega_venus: float = 360.0 / 224.7
-    # radii (AU) - circles
     r_earth: float = 1.0
     r_venus: float = 0.723
-    # initial angles (deg)
     theta_e0: float = 0.0
     theta_v0: float = 35.0
-    # nominal arrival day (last section time should match)
-    t_end_day: float = 170.0
+    t_end_day: float = 170.0  # last section time
 
 def pos_au(r: float, theta_deg: float) -> np.ndarray:
     th = math.radians(theta_deg)
@@ -74,35 +118,32 @@ def pos_au(r: float, theta_deg: float) -> np.ndarray:
 def ephem_at_day(t_day: float, eph: EphemConfig) -> Dict[str, np.ndarray]:
     th_e = eph.theta_e0 + eph.omega_earth * t_day
     th_v = eph.theta_v0 + eph.omega_venus * t_day
-    p_e = pos_au(eph.r_earth, th_e)
-    p_v = pos_au(eph.r_venus, th_v)
-    return {"earth": p_e, "venus": p_v, "th_e": th_e, "th_v": th_v}
+    return {"earth": pos_au(eph.r_earth, th_e), "venus": pos_au(eph.r_venus, th_v), "th_e": th_e, "th_v": th_v}
 
-def sc_nominal_at_section(k: int, n: int, t_day: float, eph: EphemConfig) -> Dict[str, np.ndarray]:
+def sc_nominal_at_index(k: int, n: int, eph: EphemConfig) -> Dict[str, np.ndarray]:
     """
-    “ノミナル(計画)”は最終点で金星位置に一致させる。
-    角度は Earth(t0) -> Venus(t_end) を線形補間（概念）
-    半径も 1AU -> 0.723AU を線形補間（概念）
+    “ノミナル（計画）”は最終インデックスで金星位置(到着時刻)に一致させる。
+    角度：Earth(t=0) -> Venus(t=t_end) を線形補間（概念）
+    半径：1AU -> 0.723AU を線形補間（概念）
     """
     frac = 0.0 if n <= 1 else k / (n - 1)
 
-    # start angle = Earth at day0, target angle = Venus at arrival day
     e0 = ephem_at_day(0.0, eph)
     vend = ephem_at_day(eph.t_end_day, eph)
+
     th_start = float(e0["th_e"])
     th_target = float(vend["th_v"])
 
     th_sc = (1.0 - frac) * th_start + frac * th_target
     r_sc = eph.r_earth + (eph.r_venus - eph.r_earth) * frac
     p_sc = pos_au(r_sc, th_sc)
-    return {"sc": p_sc, "th_sc": th_sc, "r_sc": r_sc, "th_target": th_target}
+    return {"sc": p_sc, "th_sc": th_sc, "r_sc": r_sc}
 
 def earth_angle_from_geometry(t_day: float, k: int, n: int, eph: EphemConfig) -> float:
-    """Signed heliocentric phase angle (Earth - SC) in degrees, wrapped to [-180,180)."""
+    """Signed heliocentric phase angle (Earth - SC) in degrees."""
     e = ephem_at_day(t_day, eph)
-    sc = sc_nominal_at_section(k, n, t_day, eph)
-    ang = wrap180(float(e["th_e"]) - float(sc["th_sc"]))
-    return float(ang)
+    sc = sc_nominal_at_index(k, n, eph)
+    return float(wrap180(float(e["th_e"]) - float(sc["th_sc"])))
 
 
 # -----------------------------
@@ -124,11 +165,9 @@ def build_sections() -> List[Section]:
         return np.array([[a, b], [c, d]], dtype=float)
 
     times = [0, 25, 55, 85, 115, 145, 170]
-
     S_pre = mat(180, 40, -20, 140)
     S_pre2 = mat(210, 60, -40, 170)
     S_pre3 = mat(240, 70, -60, 190)
-
     S_post = mat(520, 130, -90, 430)
     S_post2 = mat(560, 150, -110, 460)
     S_post3 = mat(600, 170, -120, 500)
@@ -165,9 +204,11 @@ class GameConfig:
     plan_beta_in_deg: float = 0.0
     plan_beta_out_deg: float = 0.0
 
+    # comm and pointing model
     comm_window_deg: float = 20.0
     beta_point_coupling: float = 0.70
 
+    # energy
     energy_max: float = 200.0
     energy_init: float = 140.0
     energy_min_for_comm: float = 30.0
@@ -176,6 +217,7 @@ class GameConfig:
     comm_cost: float = 10.0
     maneuver_energy_scale: float = 0.02
 
+    # science data
     data_buffer_max: float = 60.0
     data_collect_hi: float = 12.0
     data_collect_lo: float = 4.0
@@ -215,10 +257,7 @@ class GameState:
 def init_game(cfg: GameConfig, sections: List[Section], seed: int) -> GameState:
     rng = np.random.default_rng(seed)
 
-    p_true = np.array(
-        [1.0 + rng.normal(0, cfg.sigma_gain_in0), 1.0 + rng.normal(0, cfg.sigma_gain_out0)],
-        dtype=float,
-    )
+    p_true = np.array([1.0 + rng.normal(0, cfg.sigma_gain_in0), 1.0 + rng.normal(0, cfg.sigma_gain_out0)], dtype=float)
     p_est = np.array([1.0, 1.0], dtype=float)
     P_cov = np.diag([cfg.sigma_gain_in0**2, cfg.sigma_gain_out0**2])
 
@@ -353,17 +392,9 @@ def preview_next(state: GameState, cfg: GameConfig, sections: List[Section], sec
 
     sig_rcs = cfg.rcs_sigma_per_sqrt_maneuver * math.sqrt(max(maneuvers, 0.0))
     cov_rcs = np.eye(2) * (sig_rcs**2)
-
     cov_pred = cov_gain + cov_rcs
 
-    return {
-        "dβ": dβ,
-        "comm_ok": comm_ok,
-        "maneuvers": maneuvers,
-        "budget_limited": bool(limited),
-        "B_pred": B_pred,
-        "cov_pred": cov_pred,
-    }
+    return {"dβ": dβ, "comm_ok": comm_ok, "maneuvers": maneuvers, "budget_limited": bool(limited), "B_pred": B_pred, "cov_pred": cov_pred}
 
 def execute_section(state: GameState, cfg: GameConfig, sections: List[Section]) -> None:
     rng = np.random.default_rng()
@@ -430,6 +461,7 @@ def execute_section(state: GameState, cfg: GameConfig, sections: List[Section]) 
             "energy": float(state.energy),
             "data_downlinked": float(down),
             "data_buffer": float(state.data_buffer),
+            "data_lost_total": float(state.data_lost),
             "dist_to_target_km": float(l2(state.B_true - cfg.target)),
         }
     )
@@ -442,7 +474,34 @@ def execute_section(state: GameState, cfg: GameConfig, sections: List[Section]) 
 
 
 # -----------------------------
-# Plots
+# Score (restored)
+# -----------------------------
+def score_game(state: GameState, cfg: GameConfig):
+    dist = l2(state.B_true - cfg.target)
+    used = cfg.maneuver_budget - state.maneuvers_left
+
+    base = 10000.0
+    dist_pen = 0.65 * dist
+    manv_pen = 0.25 * used
+    data_bonus = 55.0 * state.data_downlinked
+    energy_bonus = 8.0 * state.energy
+    data_loss_pen = 25.0 * state.data_lost
+    blackout_pen = 600.0 * state.blackout_count
+
+    s = base - dist_pen - manv_pen + data_bonus + energy_bonus - data_loss_pen - blackout_pen
+    s = max(0.0, s)
+    return s, {
+        "final_distance_km": float(dist),
+        "maneuvers_used": float(used),
+        "energy_left": float(state.energy),
+        "science_downlinked": float(state.data_downlinked),
+        "data_lost": float(state.data_lost),
+        "blackouts": int(state.blackout_count),
+    }
+
+
+# -----------------------------
+# Plots (Matplotlib)
 # -----------------------------
 def controllability_poly(section: Section) -> np.ndarray:
     di, do = section.dbeta_in_max, section.dbeta_out_max
@@ -499,7 +558,8 @@ def plot_bplane(state: GameState, cfg: GameConfig, sections: List[Section], show
     ax.plot([], [], color="#ffcc00", linewidth=2.6, label="ターゲット半径")
 
     w, h, ang = ellipse_params(B_pred, cov_pred, k_sigma=cfg.pred_ellipse_sigma)
-    ax.add_patch(Ellipse((B_pred[0], B_pred[1]), width=w, height=h, angle=ang, fill=False, edgecolor="white", linewidth=2.2, linestyle=":", alpha=0.95, zorder=4))
+    ax.add_patch(Ellipse((B_pred[0], B_pred[1]), width=w, height=h, angle=ang, fill=False,
+                         edgecolor="white", linewidth=2.2, linestyle=":", alpha=0.95, zorder=4))
     ax.plot([], [], color="white", linestyle=":", linewidth=2.2, label="予測範囲（1σ）")
 
     ax.scatter([cfg.target[0]], [cfg.target[1]], s=70, color="#8aa2c8", zorder=5, label="ターゲット中心")
@@ -540,12 +600,13 @@ def plot_orbits_2d_nominal(state: GameState, cfg: GameConfig, sections: List[Sec
     sec_now = sections[min(state.k, n-1)]
     t_now = sec_now.t_day
     e = ephem_at_day(t_now, eph)
-    earth = e["earth"]; venus = e["venus"]
+    earth = e["earth"]
+    venus = e["venus"]
 
+    # nominal spacecraft track by index
     pts_sc = []
     for i in range(0, min(state.k, n-1) + 1):
-        sec = sections[i]
-        pts_sc.append(sc_nominal_at_section(i, n, sec.t_day, eph)["sc"])
+        pts_sc.append(sc_nominal_at_index(i, n, eph)["sc"])
     pts_sc = np.stack(pts_sc, axis=0)
 
     ths = np.linspace(0, 2*math.pi, 400)
@@ -567,10 +628,12 @@ def plot_orbits_2d_nominal(state: GameState, cfg: GameConfig, sections: List[Sec
     ax.plot(pts_sc[:,0], pts_sc[:,1], color="white", linewidth=2.8, alpha=0.95, label="IKAROS（計画：ノミナル）", zorder=8)
     ax.scatter([pts_sc[-1,0]],[pts_sc[-1,1]], color="white", s=90, zorder=9)
 
+    # meet check at arrival
     vend = ephem_at_day(eph.t_end_day, eph)["venus"]
-    scend = sc_nominal_at_section(n-1, n, eph.t_end_day, eph)["sc"]
+    scend = sc_nominal_at_index(n-1, n, eph)["sc"]
     err = float(np.linalg.norm(vend - scend))
-    t = ax.text(0.02, 0.98, f"到着一致チェック：|Venus - Nominal| ≈ {err:.3e} AU",
+
+    t = ax.text(0.02, 0.98, f"到着一致チェック：|Venus - Nominal| ≈ {err:.3e} AU（0に近いほど一致）",
                 transform=ax.transAxes, ha="left", va="top", color="white", fontsize=11)
     t.set_path_effects([pe.Stroke(linewidth=3, foreground="black"), pe.Normal()])
 
@@ -635,9 +698,7 @@ def plot_beta_maps(state: GameState, cfg: GameConfig, sections: List[Section]):
         ax.set_facecolor("#0b0f16")
         ax.tick_params(colors="#cbd5e1")
 
-    im1 = ax1.imshow(net, origin="lower",
-                     extent=[xs[0], xs[-1], ys[0], ys[-1]],
-                     aspect="equal")
+    im1 = ax1.imshow(net, origin="lower", extent=[xs[0], xs[-1], ys[0], ys[-1]], aspect="equal")
     ax1.set_title("電力収支", color="white", fontsize=12)
     ax1.set_xlabel("βin [deg]", color="white")
     ax1.set_ylabel("βout [deg]", color="white")
@@ -645,9 +706,8 @@ def plot_beta_maps(state: GameState, cfg: GameConfig, sections: List[Section]):
     cb1.ax.tick_params(colors="#cbd5e1")
     cb1.set_label("収支", color="white")
 
-    im2 = ax2.imshow(down, origin="lower",
-                     extent=[xs[0], xs[-1], ys[0], ys[-1]],
-                     aspect="equal", vmin=0, vmax=max(1.0, float(cfg.data_downlink_cap)))
+    im2 = ax2.imshow(down, origin="lower", extent=[xs[0], xs[-1], ys[0], ys[-1]], aspect="equal",
+                     vmin=0, vmax=max(1.0, float(cfg.data_downlink_cap)))
     ax2.set_title("DL量（通信できるときだけ）", color="white", fontsize=12)
     ax2.set_xlabel("βin [deg]", color="white")
     ax2.set_ylabel("βout [deg]", color="white")
@@ -666,6 +726,10 @@ def plot_beta_maps(state: GameState, cfg: GameConfig, sections: List[Section]):
     plt.tight_layout(rect=[0, 0.03, 1, 1])
     return fig
 
+
+# -----------------------------
+# Plot: Geometry 3D (Plotly)
+# -----------------------------
 def rot_z(deg: float) -> np.ndarray:
     th = math.radians(deg)
     c, s = math.cos(th), math.sin(th)
@@ -734,9 +798,9 @@ def geometry_3d_figure(state: GameState, cfg: GameConfig, sections: List[Section
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="IKAROS B-plane Darts v10", layout="wide")
+st.set_page_config(page_title="IKAROS B-plane Darts v11", layout="wide")
 st.title("🎯 IKAROS：B-plane ダーツ（運用ゲーム）")
-st.caption("v10：B-planeメイン。2D軌道図はノミナルが金星と一致。Matplotlib日本語化。")
+st.caption("v11：japanize_matplotlib依存を削除（Python 3.13対応）。B-planeメイン、2D軌道図はノミナルが金星と一致。")
 
 sections = build_sections()
 cfg = GameConfig()
@@ -745,6 +809,13 @@ with st.sidebar:
     st.header("設定")
     seed = st.number_input("シード（同じ問題を再現）", min_value=1, max_value=999999, value=42, step=1)
     show_truth = st.toggle("先生モード：真値を表示", value=False)
+    st.divider()
+    st.subheader("日本語フォント")
+    if JP_FONT_NAME:
+        st.caption(f"使用フォント：{JP_FONT_NAME}")
+    else:
+        st.warning("日本語フォントが見つからず、文字が□になる可能性があります。")
+
     st.divider()
     st.subheader("学習ポイント")
     st.markdown(
@@ -757,26 +828,27 @@ with st.sidebar:
     )
 
 seed_int = int(seed)
-if "bplane_state_v10" not in st.session_state or st.session_state.get("bplane_seed_v10") != seed_int:
-    st.session_state.bplane_state_v10 = init_game(cfg, sections, seed=seed_int)
-    st.session_state.bplane_seed_v10 = seed_int
-    st.session_state.page_v10 = "Play"
+if "bplane_state_v11" not in st.session_state or st.session_state.get("bplane_seed_v11") != seed_int:
+    st.session_state.bplane_state_v11 = init_game(cfg, sections, seed=seed_int)
+    st.session_state.bplane_seed_v11 = seed_int
+    st.session_state.page_v11 = "Play"
 
-state: GameState = st.session_state.bplane_state_v10
+state: GameState = st.session_state.bplane_state_v11
 
 def rerun():
     (st.rerun() if hasattr(st, "rerun") else st.experimental_rerun())
 
 def reset():
-    st.session_state.bplane_state_v10 = init_game(cfg, sections, seed=seed_int)
-    st.session_state.page_v10 = "Play"
+    st.session_state.bplane_state_v11 = init_game(cfg, sections, seed=seed_int)
+    st.session_state.page_v11 = "Play"
     rerun()
 
 if state.phase == "result":
-    st.session_state.page_v10 = "Result"
+    st.session_state.page_v11 = "Result"
 
-page = st.radio("ページ", ["Play", "Result"], horizontal=True, index=(0 if st.session_state.page_v10 == "Play" else 1))
-st.session_state.page_v10 = page
+page = st.radio("ページ", ["Play", "Result"], horizontal=True, index=(0 if st.session_state.page_v11 == "Play" else 1))
+st.session_state.page_v11 = page
+
 
 def render_play():
     sec = sections[min(state.k, len(sections) - 1)]
@@ -814,6 +886,7 @@ def render_play():
         st.warning("このβだと通信NG見込み → 実行するとΔβ=0固定＆DLできない。")
 
     left, right = st.columns([1.0, 1.0], gap="large")
+
     with left:
         st.subheader("位置関係（2D軌道図：ノミナル）")
         st.pyplot(plot_orbits_2d_nominal(state, cfg, sections), use_container_width=True)
@@ -829,22 +902,22 @@ def render_play():
         st.pyplot(plot_beta_maps(state, cfg, sections), use_container_width=True)
 
         st.subheader("幾何（3D表示）")
+        st.caption("ドラッグで回転できます。")
         st.plotly_chart(geometry_3d_figure(state, cfg, sections), use_container_width=True)
 
         st.subheader("コマンド（βin / βout）")
         if not sec.uplink_possible:
             st.error("このセクションは NO-LINK：通信不可（コマンド固定）。")
+
         cA, cB = st.columns(2)
         with cA:
             bi = st.slider("βin [deg]", -35.0, 35.0, float(state.beta_in), 1.0)
         with cB:
             bo = st.slider("βout [deg]", -35.0, 35.0, float(state.beta_out), 1.0)
+
         state.beta_in = float(bi)
         state.beta_out = float(bo)
 
-    if state.log:
-        st.subheader("ログ（必要なら）")
-        st.dataframe(pd.DataFrame(state.log), use_container_width=True, hide_index=True)
 
 def render_result():
     st.header("📊 リザルト")
@@ -865,10 +938,11 @@ def render_result():
     if state.log:
         df = pd.DataFrame(state.log)
         st.subheader("推移まとめ")
-        st.line_chart(df.set_index("turn")[["dist_to_target_km", "energy", "earth_angle_deg", "data_buffer"]], height=280)
+        st.line_chart(df.set_index("turn")[["dist_to_target_km", "energy", "earth_angle_deg", "data_buffer", "data_lost_total"]], height=280)
 
     if st.button("🔁 もう一回（リセット）", use_container_width=True):
         reset()
+
 
 if page == "Play":
     render_play()

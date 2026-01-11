@@ -1,11 +1,10 @@
-# IKAROS：B-plane ダーツ v10
+# IKAROS：B-plane ダーツ v11
 
-## 変更点
-- 2D軌道図：ノミナル(計画)が最終で金星位置に一致するように補間を修正
-- Matplotlib日本語化：japanize_matplotlib を導入（文字化け対策）
-- コマンド：直打ちを削除し、スライダーのみ
-- 画面構成：B-planeをメイン表示（最上段・大きく）
-- 幾何：Plotly 3Dで回転表示
+## v10からの修正
+- `japanize_matplotlib` を削除（Python 3.13で distutils が無く落ちるため）
+- 代わりに Matplotlib のシステムフォントから日本語対応フォント(Noto Sans CJK JP等)を自動選択
+- v10で欠けていた `score_game()` を復活
+- B-planeメイン、2D軌道図のノミナルは最終で金星位置に一致
 
 ## 実行
 ```bash
