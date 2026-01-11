@@ -1,21 +1,11 @@
 """
 フォント設定（Matplotlib）
 
-Streamlit Cloud / Python 3.13 環境だと、
-- OSに日本語フォントが入っていない
-- あるいは入っていても名前が変わる
-ことがあり、文字化け（□）が起きがちです。
-
-そこで、このプロジェクトでは
-  assets/fonts/NotoSansCJK-Regular.ttc
-を“同梱”して、必ずそれを使うようにします。
-
-※ このフォントは Noto Sans CJK（Google）で、一般に再配布可能なライセンスです。
+assets/fonts にフォントを“同梱”し、それを優先的に使います。
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -24,9 +14,6 @@ from matplotlib import font_manager as fm
 
 
 def setup_japanese_font(font_path: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    font_path のフォントを Matplotlib に登録し、デフォルトフォントに設定する。
-    """
     p = Path(font_path)
     if not p.exists():
         matplotlib.rcParams["font.family"] = "DejaVu Sans"
@@ -46,5 +33,11 @@ def setup_japanese_font(font_path: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def default_bundled_font_path() -> str:
-    # app.py からの相対で呼ばれる想定（カレント = プロジェクトルート）
-    return os.path.join("assets", "fonts", "NotoSansCJK-Regular.ttc")
+    base = Path("assets") / "fonts"
+    if not base.exists():
+        return str(base / "NotoSansCJK-Regular.ttc")
+
+    for p in base.iterdir():
+        if p.is_file() and p.suffix.lower() in [".ttf", ".otf", ".ttc"]:
+            return str(p)
+    return str(base / "NotoSansCJK-Regular.ttc")

@@ -20,16 +20,16 @@ import plotly.graph_objects as go
 from .config import GameConfig
 from .model import (
     GameState, Section,
-    preview_next, comm_available,
-    beta_eff, beta_pointing,
+    preview_next,
     ephem_at_day, sc_nominal_at_index, sc_nominal_at_fraction,
-    earth_angle_base_deg, predicted_earth_angle_deg,
+    current_positions, comm_ok,
+)
+from .attitude import (
+    unit, compute_dirs, sail_normal_from_beta, angle_deg,
+    downlink_rate_from_gamma, power_from_alpha,
 )
 
 
-# -----------------------------
-# ちょっとした共通部品
-# -----------------------------
 def annotate_outlined(ax, x, y, text, dx=10, dy=10):
     """黒フチ文字（暗背景で読みやすくする）"""
     t = ax.annotate(text, (x, y), xytext=(dx, dy), textcoords="offset points",
@@ -37,8 +37,9 @@ def annotate_outlined(ax, x, y, text, dx=10, dy=10):
     t.set_path_effects([pe.Stroke(linewidth=3, foreground="black"), pe.Normal()])
     return t
 
+
 def controllability_poly(section: Section) -> np.ndarray:
-    """Δβの範囲（箱）を、B-plane上の多角形に写像したもの（概念）"""
+    """Δβの範囲（箱）を、B-plane上の多角形に写像（概念）"""
     di, do = section.dbeta_in_max, section.dbeta_out_max
     S = section.S
     corners = []
@@ -51,12 +52,9 @@ def controllability_poly(section: Section) -> np.ndarray:
     poly = np.stack([corners[i] for i in order] + [corners[order[0]]], axis=0)
     return poly
 
+
 def ellipse_params(cov: np.ndarray, k_sigma: float = 1.0) -> Tuple[float, float, float]:
-    """
-    2D共分散 → 楕円（幅/高さ/角度）
-    ※ “楕円が時々出ない”の主因は、幅・高さがほぼ0になるケースだったので、
-       呼び出し側で最小サイズを与える。
-    """
+    """2D共分散 → 楕円（幅/高さ/角度）"""
     cov = cov + np.eye(2) * 1e-9
     w, V = np.linalg.eigh(cov)
     w = np.maximum(w, 1e-12)
@@ -71,9 +69,6 @@ def ellipse_params(cov: np.ndarray, k_sigma: float = 1.0) -> Tuple[float, float,
     return width, height, ang
 
 
-# -----------------------------
-# B-plane 図（メイン）
-# -----------------------------
 def plot_bplane(state: GameState, cfg: GameConfig, sections: List[Section], show_truth: bool):
     sec = sections[min(state.k, len(sections) - 1)]
     pv = preview_next(state, cfg, sections, sec)
@@ -90,21 +85,16 @@ def plot_bplane(state: GameState, cfg: GameConfig, sections: List[Section], show
     fig.patch.set_facecolor("#0b0f16")
     ax.set_facecolor("#0b0f16")
 
-    # 制御可能範囲（面）
     ax.add_patch(Polygon(poly, closed=True, facecolor="#00d1ff", edgecolor="none", alpha=0.08, zorder=1))
     ax.plot(poly[:, 0], poly[:, 1], linestyle="--", linewidth=2.0, color="#00d1ff", alpha=0.85,
             label="制御可能範囲（境界）", zorder=2)
 
-    # ターゲット（的）
     ax.add_patch(Circle((cfg.target[0], cfg.target[1]), target_r, fill=False, linewidth=2.6,
                         edgecolor="#ffcc00", alpha=0.95, zorder=3))
     ax.plot([], [], color="#ffcc00", linewidth=2.6, label="ターゲット半径")
 
-    # 予測楕円（1σ）
     w, h, ang = ellipse_params(cov_pred, k_sigma=cfg.pred_ellipse_sigma)
-
-    # “楕円が見えない”対策：最小サイズを入れる
-    # （単位はkmなので、数十km以下は見えない＝消えたように見える）
+    # “楕円が消える”対策：小さすぎる場合は見えるサイズに下駄を履かせる
     w = max(float(w), 350.0)
     h = max(float(h), 350.0)
 
@@ -112,7 +102,6 @@ def plot_bplane(state: GameState, cfg: GameConfig, sections: List[Section], show
                          edgecolor="white", linewidth=2.2, linestyle=":", alpha=0.95, zorder=4))
     ax.plot([], [], color="white", linestyle=":", linewidth=2.2, label="予測範囲（1σ）")
 
-    # 点
     ax.scatter([cfg.target[0]], [cfg.target[1]], s=70, color="#8aa2c8", zorder=5, label="ターゲット中心")
     ax.scatter([state.B_est[0]], [state.B_est[1]], s=90, color="#5dade2", marker="s", zorder=6, label="推定点E（いま）")
     ax.scatter([B_pred[0]], [B_pred[1]], s=90, color="white", marker="o", zorder=7, label="予測中心")
@@ -148,9 +137,6 @@ def plot_bplane(state: GameState, cfg: GameConfig, sections: List[Section], show
     return fig
 
 
-# -----------------------------
-# 2D軌道図（ノミナルを曲線で表示）
-# -----------------------------
 def plot_orbits_2d_nominal(state: GameState, cfg: GameConfig, sections: List[Section]):
     eph = cfg.eph
     n = len(sections)
@@ -161,9 +147,9 @@ def plot_orbits_2d_nominal(state: GameState, cfg: GameConfig, sections: List[Sec
     earth = e["earth"]
     venus = e["venus"]
 
-    # 曲線表示：uを細かく刻んでノミナルをサンプリング
+    # 曲線：uを細かく刻んでノミナルをサンプリング
     u_now = 0.0 if n <= 1 else min(1.0, float(state.k) / float(n - 1))
-    us = np.linspace(0.0, max(u_now, 1e-6), 200)
+    us = np.linspace(0.0, max(u_now, 1e-6), 240)
     pts_sc = np.stack([sc_nominal_at_fraction(u, eph)["sc"] for u in us], axis=0)
 
     ths = np.linspace(0, 2 * math.pi, 400)
@@ -182,7 +168,6 @@ def plot_orbits_2d_nominal(state: GameState, cfg: GameConfig, sections: List[Sec
     ax.scatter([earth[0]], [earth[1]], s=85, color="#3b82f6", label="地球（いま）", zorder=7)
     ax.scatter([venus[0]], [venus[1]], s=85, color="#22c55e", label="金星（いま）", zorder=7)
 
-    # ノミナル（曲線）
     ax.plot(pts_sc[:, 0], pts_sc[:, 1], color="white", linewidth=2.8, alpha=0.95, label="IKAROS（計画：ノミナル）", zorder=8)
     ax.scatter([pts_sc[-1, 0]], [pts_sc[-1, 1]], color="white", s=90, zorder=9, label="IKAROS（いま）")
 
@@ -190,15 +175,9 @@ def plot_orbits_2d_nominal(state: GameState, cfg: GameConfig, sections: List[Sec
     vend = ephem_at_day(eph.t_end_day, eph)["venus"]
     scend = sc_nominal_at_index(n - 1, n, eph)["sc"]
     err = float(np.linalg.norm(vend - scend))
-
     t = ax.text(0.02, 0.98, f"到着一致チェック：|Venus - Nominal| ≈ {err:.3e} AU（0に近いほど一致）",
                 transform=ax.transAxes, ha="left", va="top", color="white", fontsize=11)
     t.set_path_effects([pe.Stroke(linewidth=3, foreground="black"), pe.Normal()])
-
-    base = earth_angle_base_deg(state, cfg, sections)
-    t2 = ax.text(0.02, 0.90, f"地球角（幾何ベース） ≈ {base:+.1f}°",
-                 transform=ax.transAxes, ha="left", va="top", color="white", fontsize=11)
-    t2.set_path_effects([pe.Stroke(linewidth=3, foreground="black"), pe.Normal()])
 
     ax.set_aspect("equal", adjustable="box")
     ax.set_title("位置関係（2D軌道図：ノミナル）", color="white", fontsize=14, pad=10)
@@ -221,38 +200,50 @@ def plot_orbits_2d_nominal(state: GameState, cfg: GameConfig, sections: List[Sec
     return fig
 
 
-# -----------------------------
-# βin×βout マップ（電力収支 / DL量）
-# -----------------------------
 def beta_map_grids(state: GameState, cfg: GameConfig, sections: List[Section], step: float = 2.0):
+    """βin×βout格子に対し、角度モデルで電力収支/DL/通信領域を作る"""
     bmin, bmax = -35.0, 35.0
     xs = np.arange(bmin, bmax + 1e-9, step)
     ys = np.arange(bmin, bmax + 1e-9, step)
     X, Y = np.meshgrid(xs, ys)
 
     net = np.zeros_like(X, dtype=float)
-    down = np.zeros_like(X, dtype=float)
-    comm_ok = np.zeros_like(X, dtype=float)
+    dl = np.zeros_like(X, dtype=float)
+    comm_mask = np.zeros_like(X, dtype=float)
+
+    r_sc, r_e, _ = current_positions(state, cfg, sections)
+    s_hat, e_hat = compute_dirs(r_sc, r_e)
+
+    sec = sections[min(state.k, len(sections) - 1)]
+    no_link = (not sec.uplink_possible)
 
     for i in range(Y.shape[0]):
         for j in range(X.shape[1]):
             bi = float(X[i, j])
             bo = float(Y[i, j])
-            be = beta_eff(bi, bo)
-            gen = cfg.gen_scale * max(0.0, math.cos(math.radians(be)))
-            ok = comm_available(bi, bo, state, cfg, sections)
-            comm_ok[i, j] = 1.0 if ok else 0.0
-            cost = cfg.base_load + (cfg.comm_cost if ok else 0.0)
-            net[i, j] = gen - cost
-            down[i, j] = cfg.data_downlink_cap if ok else 0.0
 
-    return xs, ys, net, down, comm_ok
+            n_hat = sail_normal_from_beta(bi, bo, s_hat)
+            alpha = angle_deg(n_hat, s_hat)
+            gamma = angle_deg(n_hat, e_hat)
+
+            Pgen = power_from_alpha(alpha, cfg.gen_scale, cfg.gen_cos_k)
+
+            ok = (False if no_link else (gamma <= cfg.comm_cone_deg and state.energy >= cfg.energy_min_for_comm))
+            comm_mask[i, j] = 1.0 if ok else 0.0
+
+            cost = cfg.base_load + (cfg.comm_cost if ok else 0.0)
+            net[i, j] = Pgen - cost
+
+            dl[i, j] = downlink_rate_from_gamma(gamma, cfg.comm_cone_deg, cfg.data_downlink_cap) if ok else 0.0
+
+    return xs, ys, net, dl, comm_mask
+
 
 def plot_beta_maps(state: GameState, cfg: GameConfig, sections: List[Section]):
-    xs, ys, net, down, comm_ok = beta_map_grids(state, cfg, sections, step=2.0)
+    xs, ys, net, dl, comm_mask = beta_map_grids(state, cfg, sections, step=2.0)
 
     fig = plt.figure(figsize=(10.8, 4.9), dpi=150)
-    fig.patch.set_facecolor("#0b0f16")
+    fig.patch.set_facecolor("#0b0f16")  # 全体背景
 
     ax1 = fig.add_subplot(1, 2, 1)
     ax2 = fig.add_subplot(1, 2, 2)
@@ -262,71 +253,57 @@ def plot_beta_maps(state: GameState, cfg: GameConfig, sections: List[Section]):
         ax.tick_params(colors="#cbd5e1")
 
     im1 = ax1.imshow(net, origin="lower", extent=[xs[0], xs[-1], ys[0], ys[-1]], aspect="equal")
-    ax1.set_title("電力収支", color="white", fontsize=12)
+    ax1.set_title("電力収支  ΔE = 発電 - 消費", color="white", fontsize=12)
     ax1.set_xlabel("βin [deg]", color="white")
     ax1.set_ylabel("βout [deg]", color="white")
     cb1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
     cb1.ax.tick_params(colors="#cbd5e1")
-    cb1.set_label("収支", color="white")
+    cb1.set_label("ΔE（概念）", color="white")
 
-    im2 = ax2.imshow(down, origin="lower", extent=[xs[0], xs[-1], ys[0], ys[-1]], aspect="equal",
+    im2 = ax2.imshow(dl, origin="lower", extent=[xs[0], xs[-1], ys[0], ys[-1]], aspect="equal",
                      vmin=0, vmax=max(1.0, float(cfg.data_downlink_cap)))
-    ax2.set_title("DL量（通信できるときだけ）", color="white", fontsize=12)
+    ax2.set_title("DL量（中心ほど↑、端ほど↓）", color="white", fontsize=12)
     ax2.set_xlabel("βin [deg]", color="white")
     ax2.set_ylabel("βout [deg]", color="white")
     cb2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
     cb2.ax.tick_params(colors="#cbd5e1")
-    cb2.set_label("DL", color="white")
+    cb2.set_label("DL（概念）", color="white")
 
-    # 通信OK領域を“緑線＋薄塗り”で見せる
     for ax in (ax1, ax2):
-        ax.contour(xs, ys, comm_ok, levels=[0.5], colors=["#9cff57"], linewidths=2.2)
-        ax.contourf(xs, ys, comm_ok, levels=[-0.1, 0.5, 1.1], colors=["#00000000", "#9cff57"], alpha=0.12)
+        # 緑：通信OK領域
+        ax.contour(xs, ys, comm_mask, levels=[0.5], colors=["#9cff57"], linewidths=2.2)
+        ax.contourf(xs, ys, comm_mask, levels=[-0.1, 0.5, 1.1], colors=["#00000000", "#9cff57"], alpha=0.12)
+
+        # 現在のβ
         ax.scatter([state.beta_in], [state.beta_out], s=80, color="white", edgecolor="black", linewidth=1.2, zorder=6)
         ax.text(state.beta_in + 1.2, state.beta_out + 1.2, "いま", color="white", fontsize=9,
                 path_effects=[pe.Stroke(linewidth=3, foreground="black"), pe.Normal()])
 
-    fig.text(0.5, 0.01, "緑の境界/面 = 通信OK領域（地球角±窓、電力が十分な場合）", ha="center", color="white", fontsize=10)
+    fig.text(0.5, 0.01, "緑の境界/面 = 通信OK領域（帆法線が地球方向コーン内＆電力条件）", ha="center", color="white", fontsize=10)
     plt.tight_layout(rect=[0, 0.03, 1, 1])
     return fig
 
 
-# -----------------------------
-# 幾何 3D（Plotly）
-# -----------------------------
-def rot_z(deg: float) -> np.ndarray:
-    th = math.radians(deg)
-    c, s = math.cos(th), math.sin(th)
-    return np.array([[c, -s, 0],
-                     [s,  c, 0],
-                     [0,  0, 1]], dtype=float)
-
-def rot_y(deg: float) -> np.ndarray:
-    th = math.radians(deg)
-    c, s = math.cos(th), math.sin(th)
-    return np.array([[ c, 0, s],
-                     [ 0, 1, 0],
-                     [-s, 0, c]], dtype=float)
-
 def geometry_3d_figure(state: GameState, cfg: GameConfig, sections: List[Section]) -> go.Figure:
-    ea = predicted_earth_angle_deg(state.beta_in, state.beta_out, state, cfg, sections)
-    be = beta_eff(state.beta_in, state.beta_out)
-    bp = beta_pointing(state.beta_in, state.beta_out)
+    """太陽方向 s / 地球方向 e / 帆法線 n の幾何を3Dで表示"""
+    r_sc, r_e, _ = current_positions(state, cfg, sections)
+    s_hat, e_hat = compute_dirs(r_sc, r_e)
+    n_hat = sail_normal_from_beta(state.beta_in, state.beta_out, s_hat)
 
-    # 概念ベクトル：太陽光を +X とする
-    sun = np.array([1.0, 0.0, 0.0])
-    earth = np.array([math.cos(math.radians(ea)), math.sin(math.radians(ea)), 0.0])
+    alpha = angle_deg(n_hat, s_hat)
+    gamma = angle_deg(n_hat, e_hat)
 
-    # 帆法線：βpointでZ回転 → βeffでY回転（概念）
-    n = rot_z(bp) @ rot_y(be) @ np.array([1.0, 0.0, 0.0])
-    n_norm = n / (np.linalg.norm(n) + 1e-9)
+    def vec_trace(vec, name, color):
+        return go.Scatter3d(x=[0, vec[0]], y=[0, vec[1]], z=[0, vec[2]], mode="lines",
+                            line=dict(width=6, color=color), name=name)
 
     # 帆平面（法線に直交する四角形）
+    n = n_hat
     tmp = np.array([0.0, 0.0, 1.0])
-    if abs(float(n_norm.dot(tmp))) > 0.9:
+    if abs(float(np.dot(n, tmp))) > 0.9:
         tmp = np.array([0.0, 1.0, 0.0])
-    u = np.cross(n_norm, tmp); u = u / (np.linalg.norm(u) + 1e-9)
-    v = np.cross(n_norm, u); v = v / (np.linalg.norm(v) + 1e-9)
+    u = unit(np.cross(n, tmp))
+    v = unit(np.cross(n, u))
     s = 0.65
     corners = np.stack([ s*u + s*v,
                          s*u - s*v,
@@ -334,23 +311,21 @@ def geometry_3d_figure(state: GameState, cfg: GameConfig, sections: List[Section
                         -s*u + s*v,
                          s*u + s*v ], axis=0)
 
-    def vec_trace(vec, name, color):
-        return go.Scatter3d(x=[0, vec[0]], y=[0, vec[1]], z=[0, vec[2]], mode="lines",
-                            line=dict(width=6, color=color), name=name)
-
     fig = go.Figure()
-    fig.add_trace(vec_trace(sun, "太陽光", "#ffcc00"))
-    fig.add_trace(vec_trace(earth, "地球方向", "#9cff57"))
-    fig.add_trace(vec_trace(n_norm, "帆法線", "#00d1ff"))
+    fig.add_trace(vec_trace(s_hat, "太陽方向 s", "#ffcc00"))
+    fig.add_trace(vec_trace(e_hat, "地球方向 e", "#9cff57"))
+    fig.add_trace(vec_trace(n_hat, "帆法線 n", "#00d1ff"))
     fig.add_trace(go.Scatter3d(x=corners[:, 0], y=corners[:, 1], z=corners[:, 2], mode="lines",
                                line=dict(width=5, color="white"), name="帆（平面）"))
     fig.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode="markers+text",
                                marker=dict(size=6, color="white"),
                                text=["IKAROS"], textposition="bottom center", name="IKAROS"))
 
+    ok = comm_ok(state.beta_in, state.beta_out, state, cfg, sections)
+
     fig.update_layout(
         margin=dict(l=0, r=0, t=30, b=0),
-        title=f"幾何（3D概念図）  βeff={be:.1f}°, βpoint={bp:+.1f}°, 地球角={ea:+.1f}°",
+        title=f"幾何（3D概念図）  α(太陽)={alpha:.1f}°, γ(地球)={gamma:.1f}°, 通信={'OK' if ok else 'NG'}",
         scene=dict(
             xaxis=dict(title="X", showbackground=False, color="white"),
             yaxis=dict(title="Y", showbackground=False, color="white"),

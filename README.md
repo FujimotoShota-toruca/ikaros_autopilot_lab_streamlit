@@ -1,11 +1,11 @@
-# IKAROS：B-plane ダーツ v12
+# IKAROS：B-plane ダーツ（角度モデル版）
 
-## v12の変更点
-- **日本語フォントを同梱**（assets/fonts/NotoSansCJK-Regular.ttc）→ Streamlit Cloudでも文字化けしにくい
-- **予測楕円が時々出ない問題を緩和**：最小サイズを設定し、NaN/Infの共分散をサニタイズ
-- **2D軌道図のノミナルを曲線表示**（uを細かくサンプリングして結線）
-- **app.pyを分割**：core/config.py, core/model.py, core/plots.py, core/fonts.py
-- **日本語コメント多め**（教材用に読みやすさ重視）
+## 方針
+- 通信/発電を **角度だけ**で定義
+  - α = angle(n, 太陽方向 s) → 発電
+  - γ = angle(n, 地球方向 e) → 通信（コーン内）
+- βin/βout は「帆法線 n を作るつまみ」
+- ノミナル軌道は u∈[0,1] の連続曲線で描画（直線結線をやめました）
 
 ## 実行
 ```bash
@@ -13,6 +13,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## 補足（ノミナルについて）
-- 本教材のノミナル（計画）は「最終で金星位置に一致」するように定義した概念曲線です。
-- “当たる/外れる”は B-plane側で表現し、軌道図は幾何（地球角・通信ウィンドウ）の直感理解に使います。
+## 日本語フォント
+同梱フォント：NotoSansCJK-Regular.ttc
+
+Streamlit Cloudで文字化けする場合は、assets/fonts に日本語フォント（ttf/otf/ttc）を追加してみてください。

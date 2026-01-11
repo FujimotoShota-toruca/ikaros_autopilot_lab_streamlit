@@ -1,19 +1,20 @@
 """
 設定まわり（ゲームパラメータ）
 
-この教材は「実フライトの正確な数値」よりも、
+この教材は「実フライトの正確な再現」ではなく、
   - SRP（太陽光圧）の可制御性が小さい
-  - 通信ウィンドウや発電とのトレードオフがある
-  - OD（軌道決定）の推定誤差が運用に効く
-という“本質”を、ゲームとして体験してもらうことを優先しています。
+  - 発電（太陽指向）と通信（地球指向）のトレードオフ
+  - OD（軌道決定）で “効き” を学習する
+をゲームとして体験することを目的にしています。
 
-そのため、モデルは意図的に単純化されています。
+v-angle 版では、通信/発電を
+  「帆面法線ベクトル n と、太陽方向 s・地球方向 e のなす角」
+だけで決める、シンプルな定義に統一しています。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
 
 import numpy as np
 
@@ -47,7 +48,7 @@ class GameConfig:
     # B-plane上のターゲット中心（km）
     target: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0], dtype=float))
 
-    # 序盤は大きめ、終盤は小さめの“的”にする（難易度を上げる）
+    # 序盤/終盤で的を小さくする（難易度を上げる）
     target_radius_early_km: float = 9000.0
     target_radius_late_km: float = 2000.0
     target_tighten_section: int = 5
@@ -56,7 +57,7 @@ class GameConfig:
     init_error_sigma_km: float = 6500.0
     init_est_sigma_km: float = 1200.0
 
-    # SRP効果の“モデル化誤差”をパラメータ化（p_true と p_est のズレ）
+    # SRP効きの“モデル化誤差”をパラメータ化（p_true と p_est のズレ）
     sigma_gain_in0: float = 0.10
     sigma_gain_out0: float = 0.08
 
@@ -74,26 +75,24 @@ class GameConfig:
     plan_beta_out_deg: float = 0.0
 
     # -------------------------
-    # 通信・指向モデル（簡易）
+    # 通信（角度モデル）
     # -------------------------
-    # 地球角がこの範囲内なら通信OK（deg）
-    comm_window_deg: float = 20.0
-
-    # βの指向（βpoint）で地球角がどれだけ動くか（概念係数）
-    beta_point_coupling: float = 0.70
+    # 地球方向 e と帆法線 n のなす角 γ がこの範囲内なら通信OK（deg）
+    comm_cone_deg: float = 20.0
 
     # -------------------------
-    # 電力モデル（簡易）
+    # 電力（角度モデル）
     # -------------------------
+    # 太陽方向 s と帆法線 n のなす角 α で発電が落ちる：Pgen = P0 * max(0,cosα)^k
+    gen_scale: float = 90.0
+    gen_cos_k: float = 1.6  # 1.0だと緩い / 2.0だとシビア
+
     energy_max: float = 200.0
     energy_init: float = 140.0
     energy_min_for_comm: float = 30.0
 
     # 常時消費（機器）
     base_load: float = 70.0
-
-    # 発電スケール（βeffが大きいほど cos で落ちる）
-    gen_scale: float = 90.0
 
     # 通信時の追加消費
     comm_cost: float = 10.0
@@ -107,9 +106,11 @@ class GameConfig:
     data_buffer_max: float = 60.0
     data_collect_hi: float = 12.0
     data_collect_lo: float = 4.0
+
+    # 最大DL（通信中心で最大、端に寄ると減る：後述のモデルで滑らかにする）
     data_downlink_cap: float = 18.0
 
-    # 予測楕円のσ（1σ / 2σ の切替などに使える）
+    # 予測楕円のσ（1σ / 2σ）
     pred_ellipse_sigma: float = 1.0
 
     # エフェメリス設定
