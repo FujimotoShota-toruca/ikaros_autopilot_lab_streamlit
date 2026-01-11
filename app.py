@@ -1,9 +1,11 @@
 # IKAROS：B-plane ダーツ（適応誘導オペレーション）
 # Streamlit + Altair (Vega-Lite)
+#
+# v3 fix: Python 3.13 dataclasses require default_factory for mutable defaults (np.ndarray).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -62,15 +64,20 @@ def build_sections() -> List[Section]:
 
 @dataclass
 class GameConfig:
-    target: np.ndarray = np.array([0.0, 0.0], dtype=float)  # BT, BR [km]
+    # IMPORTANT: np.ndarray is mutable => must use default_factory on Python 3.13+
+    target: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0], dtype=float))  # BT, BR [km]
+
     target_radius_early_km: float = 9000.0
     target_radius_late_km: float = 2000.0
     target_tighten_section: int = 5  # 1-indexed
+
     sigma_area0: float = 0.10
     sigma_spec0: float = 0.08
     meas_sigma_km: float = 500.0
+
     rcs_sigma_per_sqrt_maneuver: float = 30.0
     maneuver_budget: float = 6000.0
+
     plan_beta_in_deg: float = 0.0
     plan_beta_out_deg: float = 0.0
 
@@ -323,9 +330,6 @@ def alt_bplane_chart(state: GameState, cfg: GameConfig, sections: List[Section],
     return (base + ring_layer + ell_layer + poly_layer + pts_layer + label_layer).configure_axis(labelFontSize=12, titleFontSize=12).configure_legend(labelFontSize=12)
 
 
-# -----------------------------
-# UI
-# -----------------------------
 st.set_page_config(page_title="IKAROS B-plane Darts", layout="wide")
 st.title("🎯 IKAROS：B-plane ダーツ（適応誘導オペレーション）")
 st.caption("2週間=1ターン。βin/βout → ODで推定更新 → 後半勝負、を体感する“運用ゲーム”。")
@@ -350,11 +354,11 @@ with st.sidebar:
     )
 
 seed_int = int(seed)
-if "bplane_state_v2" not in st.session_state or st.session_state.get("bplane_seed_v2") != seed_int:
-    st.session_state.bplane_state_v2 = init_game(cfg, sections, seed=seed_int)
-    st.session_state.bplane_seed_v2 = seed_int
+if "bplane_state_v3" not in st.session_state or st.session_state.get("bplane_seed_v3") != seed_int:
+    st.session_state.bplane_state_v3 = init_game(cfg, sections, seed=seed_int)
+    st.session_state.bplane_seed_v3 = seed_int
 
-state: GameState = st.session_state.bplane_state_v2
+state: GameState = st.session_state.bplane_state_v3
 
 
 def rerun():
@@ -362,7 +366,7 @@ def rerun():
 
 
 def reset():
-    st.session_state.bplane_state_v2 = init_game(cfg, sections, seed=seed_int)
+    st.session_state.bplane_state_v3 = init_game(cfg, sections, seed=seed_int)
     rerun()
 
 

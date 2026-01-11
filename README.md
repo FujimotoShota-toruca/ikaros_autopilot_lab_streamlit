@@ -1,15 +1,14 @@
-# IKAROS：B-plane ダーツ（適応誘導オペレーション）
+# IKAROS：B-plane ダーツ（適応誘導オペレーション） v3
 
-ISSFD 2011の論文にあるIKAROS誘導の本質（制約・不確かさ・OD更新・後半勝負）を、
-B-plane上の“的当て”としてゲーム化したプロトタイプです。
+v2で発生したエラー：
+
+- `ValueError: mutable default ... use default_factory`
+
+Python 3.13 の dataclass では `np.array(...)` のような **mutable default** が禁止なので、
+`GameConfig.target` を `default_factory` に変更して修正しています。
 
 ## 実行
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-## 操作
-- βin/βout を入力（スライダー＋直打ち）
-- 「このセクションを実行」で2週間ぶん進む（7セクションで終了）
-- NO-LINKセクションはコマンド不可（Δβ=0固定）
