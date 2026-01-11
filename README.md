@@ -1,11 +1,11 @@
-# IKAROS：B-plane ダーツ v9
+# IKAROS：B-plane ダーツ v10
 
 ## 変更点
-- B-planeはMatplotlib（文字・凡例が読みやすい）
-- 位置関係を2D軌道図で表示（太陽・地球・金星・IKAROS）
-- その幾何から地球角（ベース）を計算し、βの指向で通信可否が変わる
-- βin/outマップはMatplotlibで可視化（通信OK領域は緑）
-- 幾何はPlotly 3Dで表示（回転できる）
+- 2D軌道図：ノミナル(計画)が最終で金星位置に一致するように補間を修正
+- Matplotlib日本語化：japanize_matplotlib を導入（文字化け対策）
+- コマンド：直打ちを削除し、スライダーのみ
+- 画面構成：B-planeをメイン表示（最上段・大きく）
+- 幾何：Plotly 3Dで回転表示
 
 ## 実行
 ```bash
