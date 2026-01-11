@@ -1,4 +1,5 @@
-# IKAROS B-plane Darts (Adaptive Guidance Ops Game) - Streamlit + Altair
+# IKAROS：B-plane ダーツ（適応誘導オペレーション）
+# Streamlit + Altair (Vega-Lite)
 from __future__ import annotations
 
 import math
@@ -34,6 +35,7 @@ def build_sections() -> List[Section]:
     def mat(a, b, c, d):
         return np.array([[a, b], [c, d]], dtype=float)
 
+    # Control authority grows after NO-LINK (abstracted)
     S_pre  = mat(180,  40,  -20, 140)
     S_pre2 = mat(210,  60,  -40, 170)
     S_pre3 = mat(240,  70,  -60, 190)
@@ -43,13 +45,14 @@ def build_sections() -> List[Section]:
     S_post3 = mat(600, 170, -120, 500)
     S_post4 = mat(640, 190, -140, 520)
 
+    # Parameter sensitivity (uncertainty)
     H_pre  = mat( 6000,  2500, 12000,  7000)
     H_post = mat( 4500,  2000,  9000,  5200)
 
     return [
-        Section("Section 1", S_pre,  H_pre,  6,  6,  True,  65, 0.45),
-        Section("Section 2", S_pre2, H_pre,  6,  6,  True,  80, 0.50),
-        Section("Section 3", S_pre3, H_pre,  5,  5,  True,  95, 0.55),
+        Section("Section 1", S_pre,  H_pre,   6,  6,  True,  65, 0.45),
+        Section("Section 2", S_pre2, H_pre,   6,  6,  True,  80, 0.50),
+        Section("Section 3", S_pre3, H_pre,   5,  5,  True,  95, 0.55),
         Section("Section 4 (NO-LINK)", S_post, H_post, 0, 0, False, 0, 0.60),
         Section("Section 5", S_post2, H_post, 18, 18, True, 45, 0.70),
         Section("Section 6", S_post3, H_post, 18, 18, True, 35, 0.78),
@@ -59,7 +62,7 @@ def build_sections() -> List[Section]:
 
 @dataclass
 class GameConfig:
-    target: np.ndarray = np.array([0.0, 0.0], dtype=float)
+    target: np.ndarray = np.array([0.0, 0.0], dtype=float)  # BT, BR [km]
     target_radius_early_km: float = 9000.0
     target_radius_late_km: float = 2000.0
     target_tighten_section: int = 5  # 1-indexed
@@ -91,8 +94,11 @@ class GameState:
 
 def init_game(cfg: GameConfig, sections: List[Section], seed: int) -> GameState:
     rng = np.random.default_rng(seed)
-    p_true = np.array([1.0 + rng.normal(0, cfg.sigma_area0),
-                       1.0 + rng.normal(0, cfg.sigma_spec0)], dtype=float)
+
+    p_true = np.array(
+        [1.0 + rng.normal(0, cfg.sigma_area0), 1.0 + rng.normal(0, cfg.sigma_spec0)],
+        dtype=float,
+    )
     p_est = np.array([1.0, 1.0], dtype=float)
     P_cov = np.diag([cfg.sigma_area0**2, cfg.sigma_spec0**2])
 
@@ -143,7 +149,7 @@ def compute_controllability_polygon(section: Section) -> np.ndarray:
         for so in (-do, do):
             corners.append(S @ np.array([si, so], dtype=float))
     C = np.mean(np.stack(corners), axis=0)
-    ang = [math.atan2((p-C)[1], (p-C)[0]) for p in corners]
+    ang = [math.atan2((p - C)[1], (p - C)[0]) for p in corners]
     order = np.argsort(ang)
     poly = np.stack([corners[i] for i in order] + [corners[order[0]]], axis=0)
     return poly
@@ -186,21 +192,23 @@ def execute_section(state: GameState, cfg: GameConfig, sections: List[Section]) 
     sigma = np.sqrt(np.diag(state.P_cov))
     dist = l2(state.B_true - cfg.target)
 
-    state.log.append({
-        "section": section.name,
-        "comm": section.comm,
-        "cmd_beta_in": float(cmd[0]),
-        "cmd_beta_out": float(cmd[1]),
-        "applied_dbeta_in": float(dβ[0]),
-        "applied_dbeta_out": float(dβ[1]),
-        "maneuvers_used": float(maneuvers),
-        "maneuvers_left": float(state.maneuvers_left),
-        "BT_true_km": float(state.B_true[0]),
-        "BR_true_km": float(state.B_true[1]),
-        "dist_to_target_km": float(dist),
-        "sigma_area": float(sigma[0]),
-        "sigma_spec": float(sigma[1]),
-    })
+    state.log.append(
+        {
+            "section": section.name,
+            "comm": section.comm,
+            "cmd_beta_in": float(cmd[0]),
+            "cmd_beta_out": float(cmd[1]),
+            "applied_dbeta_in": float(dβ[0]),
+            "applied_dbeta_out": float(dβ[1]),
+            "maneuvers_used": float(maneuvers),
+            "maneuvers_left": float(state.maneuvers_left),
+            "BT_true_km": float(state.B_true[0]),
+            "BR_true_km": float(state.B_true[1]),
+            "dist_to_target_km": float(dist),
+            "sigma_area": float(sigma[0]),
+            "sigma_spec": float(sigma[1]),
+        }
+    )
 
     state.k += 1
     if state.k >= len(sections):
@@ -213,7 +221,7 @@ def score_game(state: GameState, cfg: GameConfig):
     dist = l2(state.B_true - cfg.target)
     used = cfg.maneuver_budget - state.maneuvers_left
     sigma = np.sqrt(np.diag(state.P_cov))
-    est_bonus = 2000.0 / max(200.0, (sigma[0]*10000 + sigma[1]*10000))
+    est_bonus = 2000.0 / max(200.0, (sigma[0] * 10000 + sigma[1] * 10000))
     s = 10000.0 - 0.65 * dist - 0.25 * used + 1200.0 * est_bonus
     s = max(0.0, s)
     return s, {
@@ -230,27 +238,35 @@ def score_game(state: GameState, cfg: GameConfig):
 def alt_timeline(state: GameState, sections: List[Section]) -> alt.Chart:
     rows = []
     for i, s in enumerate(sections):
-        rows.append({"sec": i+1, "label": s.name, "status": "現在" if i == state.k else ("完了" if i < state.k else "未")})
-    return alt.Chart(alt.Data(values=rows)).mark_bar().encode(
-        x=alt.X("sec:O", title="セクション（2週間単位）"),
-        y=alt.Y("status:N", title=None),
-        color=alt.Color("status:N", legend=None),
-        tooltip=["label:N", "status:N"]
-    ).properties(height=70)
+        rows.append({"sec": i + 1, "label": s.name, "status": "現在" if i == state.k else ("完了" if i < state.k else "未")})
+    return (
+        alt.Chart(alt.Data(values=rows))
+        .mark_bar()
+        .encode(
+            x=alt.X("sec:O", title="セクション（2週間単位）"),
+            y=alt.Y("status:N", title=None),
+            color=alt.Color("status:N", legend=None),
+            tooltip=["label:N", "status:N"],
+        )
+        .properties(height=70)
+    )
 
 
 def alt_bplane_chart(state: GameState, cfg: GameConfig, sections: List[Section], preview_beta: Tuple[float, float], show_truth: bool) -> alt.Chart:
-    section = sections[min(state.k, len(sections)-1)]
+    section = sections[min(state.k, len(sections) - 1)]
     plan = np.array([cfg.plan_beta_in_deg, cfg.plan_beta_out_deg], dtype=float)
     preview = np.array(preview_beta, dtype=float)
     dβ = preview - plan
+
     if not section.comm:
         dβ = np.array([0.0, 0.0], dtype=float)
+
     dβ[0] = clamp(dβ[0], -section.dbeta_in_max, section.dbeta_in_max)
     dβ[1] = clamp(dβ[1], -section.dbeta_out_max, section.dbeta_out_max)
 
     B_preview = state.B_est + section.S @ dβ
 
+    # Uncertainty ellipse (axis-aligned) from mapped covariance
     P = state.P_cov
     H = section.H
     CovB = H @ P @ H.T + np.eye(2) * (cfg.meas_sigma_km**2) * 0.25
@@ -260,12 +276,13 @@ def alt_bplane_chart(state: GameState, cfg: GameConfig, sections: List[Section],
     poly = compute_controllability_polygon(section) + state.B_est.reshape(1, 2)
     poly_df = [{"BT": float(p[0]), "BR": float(p[1]), "idx": i} for i, p in enumerate(poly)]
 
-    pts = []
-    pts.append({"BT": float(cfg.target[0]), "BR": float(cfg.target[1]), "kind": "ターゲット中心"})
-    pts.append({"BT": float(state.B_est[0]), "BR": float(state.B_est[1]), "kind": "推定点 E（いま）"})
+    pts = [
+        {"BT": float(cfg.target[0]), "BR": float(cfg.target[1]), "kind": "ターゲット中心"},
+        {"BT": float(state.B_est[0]), "BR": float(state.B_est[1]), "kind": "推定点 E（いま）"},
+        {"BT": float(B_preview[0]), "BR": float(B_preview[1]), "kind": "プレビュー（このコマンド）"},
+    ]
     if state.B_obs_last is not None:
         pts.append({"BT": float(state.B_obs_last[0]), "BR": float(state.B_obs_last[1]), "kind": "OD点（前ターン）"})
-    pts.append({"BT": float(B_preview[0]), "BR": float(B_preview[1]), "kind": "プレビュー（このコマンド）"})
     if show_truth:
         pts.append({"BT": float(state.B_true[0]), "BR": float(state.B_true[1]), "kind": "真値（先生）"})
 
@@ -274,22 +291,16 @@ def alt_bplane_chart(state: GameState, cfg: GameConfig, sections: List[Section],
 
     all_bt = [p["BT"] for p in pts] + [p["BT"] for p in poly_df]
     all_br = [p["BR"] for p in pts] + [p["BR"] for p in poly_df]
-    span = max(12000.0, max(map(abs, all_bt+[0])), max(map(abs, all_br+[0])))
+    span = max(12000.0, max(map(abs, all_bt + [0])), max(map(abs, all_br + [0])))
     span = float(span * 1.15)
 
-    ring = []
-    for i in range(64 + 1):
-        th = 2 * math.pi * i / 64
-        ring.append({"BT": float(cfg.target[0] + target_r * math.cos(th)),
-                     "BR": float(cfg.target[1] + target_r * math.sin(th)),
-                     "i": i})
+    ring = [{"BT": float(cfg.target[0] + target_r * math.cos(2 * math.pi * i / 64)),
+             "BR": float(cfg.target[1] + target_r * math.sin(2 * math.pi * i / 64)),
+             "i": i} for i in range(65)]
 
-    ell = []
-    for i in range(64 + 1):
-        th = 2 * math.pi * i / 64
-        ell.append({"BT": float(state.B_est[0] + rad_BT * math.cos(th)),
-                    "BR": float(state.B_est[1] + rad_BR * math.sin(th)),
-                    "i": i})
+    ell = [{"BT": float(state.B_est[0] + rad_BT * math.cos(2 * math.pi * i / 64)),
+            "BR": float(state.B_est[1] + rad_BR * math.sin(2 * math.pi * i / 64)),
+            "i": i} for i in range(65)]
 
     pts_df = [{"BT": p["BT"], "BR": p["BR"], "kind": p["kind"]} for p in pts]
 
@@ -297,31 +308,27 @@ def alt_bplane_chart(state: GameState, cfg: GameConfig, sections: List[Section],
     ring_layer = alt.Chart(alt.Data(values=ring)).mark_line(opacity=0.35).encode(
         x=alt.X("BT:Q", title="BT [km]", scale=alt.Scale(domain=[-span, span])),
         y=alt.Y("BR:Q", title="BR [km]", scale=alt.Scale(domain=[-span, span])),
-        order="i:Q"
+        order="i:Q",
     )
-    ell_layer = alt.Chart(alt.Data(values=ell)).mark_area(opacity=0.10).encode(
-        x="BT:Q", y="BR:Q", order="i:Q"
-    )
-    poly_layer = alt.Chart(alt.Data(values=poly_df)).mark_line(opacity=0.35).encode(
-        x="BT:Q", y="BR:Q", order="idx:Q"
-    )
+    ell_layer = alt.Chart(alt.Data(values=ell)).mark_area(opacity=0.10).encode(x="BT:Q", y="BR:Q", order="i:Q")
+    poly_layer = alt.Chart(alt.Data(values=poly_df)).mark_line(opacity=0.35).encode(x="BT:Q", y="BR:Q", order="idx:Q")
     pts_layer = alt.Chart(alt.Data(values=pts_df)).mark_point(filled=True, size=120).encode(
-        x="BT:Q", y="BR:Q",
+        x="BT:Q",
+        y="BR:Q",
         shape=alt.Shape("kind:N", legend=alt.Legend(title="")),
-        tooltip=[alt.Tooltip("kind:N"), alt.Tooltip("BT:Q", format=".0f"), alt.Tooltip("BR:Q", format=".0f")]
+        tooltip=[alt.Tooltip("kind:N"), alt.Tooltip("BT:Q", format=".0f"), alt.Tooltip("BR:Q", format=".0f")],
     )
-    label_layer = alt.Chart(alt.Data(values=pts_df)).mark_text(align="left", dx=8, dy=-8).encode(
-        x="BT:Q", y="BR:Q", text="kind:N"
-    )
+    label_layer = alt.Chart(alt.Data(values=pts_df)).mark_text(align="left", dx=8, dy=-8).encode(x="BT:Q", y="BR:Q", text="kind:N")
 
-    return (base + ring_layer + ell_layer + poly_layer + pts_layer + label_layer).configure_axis(
-        labelFontSize=12, titleFontSize=12
-    ).configure_legend(labelFontSize=12)
+    return (base + ring_layer + ell_layer + poly_layer + pts_layer + label_layer).configure_axis(labelFontSize=12, titleFontSize=12).configure_legend(labelFontSize=12)
 
 
+# -----------------------------
+# UI
+# -----------------------------
 st.set_page_config(page_title="IKAROS B-plane Darts", layout="wide")
 st.title("🎯 IKAROS：B-plane ダーツ（適応誘導オペレーション）")
-st.caption("2週間=1ターン。βin/βoutのコマンド→ODで推定更新→後半勝負、を体感するゲーム。")
+st.caption("2週間=1ターン。βin/βout → ODで推定更新 → 後半勝負、を体感する“運用ゲーム”。")
 
 sections = build_sections()
 cfg = GameConfig()
@@ -332,38 +339,46 @@ with st.sidebar:
     show_truth = st.toggle("先生モード：真値を表示", value=False)
     st.divider()
     st.markdown("**学習ポイント**")
-    st.markdown("- SRPの可制御性は小さい
+    st.markdown(
+        """
+- SRPの可制御性は小さい
 - パラメータ不確かさが大きい
 - no-linkで操作不能区間がある
-- ODで推定が改善→後半が勝負
-- RCSの副作用（マヌーバ）")
+- ODで推定が改善 → 後半が勝負
+- RCSの副作用（マヌーバ）
+"""
+    )
 
-if "bplane_state_v1" not in st.session_state or st.session_state.get("bplane_seed_v1") != int(seed):
-    st.session_state.bplane_state_v1 = init_game(cfg, sections, seed=int(seed))
-    st.session_state.bplane_seed_v1 = int(seed)
+seed_int = int(seed)
+if "bplane_state_v2" not in st.session_state or st.session_state.get("bplane_seed_v2") != seed_int:
+    st.session_state.bplane_state_v2 = init_game(cfg, sections, seed=seed_int)
+    st.session_state.bplane_seed_v2 = seed_int
 
-state: GameState = st.session_state.bplane_state_v1
+state: GameState = st.session_state.bplane_state_v2
+
 
 def rerun():
     (st.rerun() if hasattr(st, "rerun") else st.experimental_rerun())
 
+
 def reset():
-    st.session_state.bplane_state_v1 = init_game(cfg, sections, seed=int(seed))
+    st.session_state.bplane_state_v2 = init_game(cfg, sections, seed=seed_int)
     rerun()
+
 
 st.altair_chart(alt_timeline(state, sections), use_container_width=True)
 
 with st.expander("ノミナル（計画）とは？", expanded=False):
-    st.markdown("""
+    st.markdown(
+        """
 - **ノミナル（計画）**：事前に作る参照（目標）状態。ここでは **計画β=0°** を基準にします。
 - **操作**：βin/βout を計画からずらす（Δβ）
 - **OD**：観測で“実際の当たり”がわかり、帆パラメータ推定が更新される
-""")
+"""
+    )
 
 left, right = st.columns([1.6, 1.0], gap="large")
-
-sec_idx = min(state.k, len(sections)-1)
-sec = sections[sec_idx]
+sec = sections[min(state.k, len(sections) - 1)]
 
 with right:
     st.subheader("コマンド（βin / βout）")
@@ -371,20 +386,22 @@ with right:
         st.warning("このセクションは NO-LINK：コマンド送信不可（Δβ=0固定）。")
 
     st.caption("このセクションの制約（簡略）")
-    st.write({
-        "Δβin 最大": f"±{sec.dbeta_in_max:.0f}°",
-        "Δβout 最大": f"±{sec.dbeta_out_max:.0f}°",
-        "maneuvers/deg": f"{sec.maneuvers_per_deg:.0f}",
-        "OD品質": f"{sec.od_gain:.2f}",
-    })
+    st.write(
+        {
+            "Δβin 最大": f"±{sec.dbeta_in_max:.0f}°",
+            "Δβout 最大": f"±{sec.dbeta_out_max:.0f}°",
+            "maneuvers/deg": f"{sec.maneuvers_per_deg:.0f}",
+            "OD品質": f"{sec.od_gain:.2f}",
+        }
+    )
 
     cA, cB = st.columns(2)
     with cA:
-        bi = st.slider("βin [deg]", -35.0, 35.0, float(state.beta_in), 1.0, disabled=(state.phase=="result"))
-        bi = float(st.number_input("βin 直打ち", -90.0, 90.0, bi, 1.0, disabled=(state.phase=="result")))
+        bi = st.slider("βin [deg]", -35.0, 35.0, float(state.beta_in), 1.0, disabled=(state.phase == "result"))
+        bi = float(st.number_input("βin 直打ち", -90.0, 90.0, bi, 1.0, disabled=(state.phase == "result")))
     with cB:
-        bo = st.slider("βout [deg]", -35.0, 35.0, float(state.beta_out), 1.0, disabled=(state.phase=="result"))
-        bo = float(st.number_input("βout 直打ち", -90.0, 90.0, bo, 1.0, disabled=(state.phase=="result")))
+        bo = st.slider("βout [deg]", -35.0, 35.0, float(state.beta_out), 1.0, disabled=(state.phase == "result"))
+        bo = float(st.number_input("βout 直打ち", -90.0, 90.0, bo, 1.0, disabled=(state.phase == "result")))
 
     state.beta_in = bi
     state.beta_out = bo
@@ -392,15 +409,15 @@ with right:
     st.subheader("テレメトリ")
     sigma = np.sqrt(np.diag(state.P_cov))
     tighten = (state.k + 1) >= cfg.target_tighten_section
-    st.metric("セクション", f"{state.k+1}/7")
+    st.metric("セクション", f"{state.k + 1}/7")
     st.metric("ターゲット半径", f"{(cfg.target_radius_late_km if tighten else cfg.target_radius_early_km):.0f} km")
-    st.metric("推定誤差(面積)", f"±{sigma[0]*100:.1f}%")
-    st.metric("推定誤差(反射率)", f"±{sigma[1]*100:.1f}%")
+    st.metric("推定誤差(面積)", f"±{sigma[0] * 100:.1f}%")
+    st.metric("推定誤差(反射率)", f"±{sigma[1] * 100:.1f}%")
     st.metric("残りマヌーバ予算", f"{state.maneuvers_left:.0f}")
 
     b1, b2 = st.columns(2)
     with b1:
-        if st.button("▶ このセクションを実行", use_container_width=True, disabled=(state.phase=="result")):
+        if st.button("▶ このセクションを実行", use_container_width=True, disabled=(state.phase == "result")):
             execute_section(state, cfg, sections)
             rerun()
     with b2:
@@ -427,6 +444,6 @@ if state.phase == "result":
     c1, c2, c3 = st.columns(3)
     c1.metric("最終距離", f"{breakdown['final_distance_km']:.0f} km")
     c2.metric("使用マヌーバ", f"{breakdown['maneuvers_used']:.0f}")
-    c3.metric("推定誤差(面積/反射率)", f"±{breakdown['sigma_area']*100:.1f}% / ±{breakdown['sigma_spec']*100:.1f}%")
+    c3.metric("推定誤差(面積/反射率)", f"±{breakdown['sigma_area'] * 100:.1f}% / ±{breakdown['sigma_spec'] * 100:.1f}%")
     st.write("内訳", breakdown)
     st.success("SRPは小さいので、可制御性より推定誤差や運用制約が効いてくる。だから適応誘導（推定→更新→後半勝負）が大事。")
