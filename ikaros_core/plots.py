@@ -191,14 +191,15 @@ def plot_orbits_2d_nominal(state: GameState, cfg: GameConfig, sections: List[Sec
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
 
-    leg = ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True, fontsize=10)
+    leg = ax.legend(loc="center left", bbox_to_anchor=(1.15, 0.5), frameon=True, fontsize=10)
     leg.get_frame().set_facecolor("#0b1220")
     leg.get_frame().set_alpha(0.85)
     for text in leg.get_texts():
         text.set_color("white")
 
     # 右側に凡例を出す分、余白を確保
-    plt.tight_layout(rect=[0, 0, 0.82, 1])
+    fig.subplots_adjust(right=0.65)
+    plt.tight_layout()
     return fig
 
 
@@ -230,7 +231,7 @@ def beta_map_grids(state: GameState, cfg: GameConfig, sections: List[Section], s
 
             Pgen = power_from_alpha(alpha, cfg.gen_scale, cfg.gen_cos_k)
 
-            ok = (False if no_link else (gamma <= cfg.comm_cone_deg and state.energy >= cfg.energy_min_for_comm))
+            ok = (False if no_link else comm_ok_from_gamma(gamma, cfg.comm_cone_deg))
             comm_mask[i, j] = 1.0 if ok else 0.0
 
             cost = cfg.base_load + (cfg.comm_cost if ok else 0.0)
@@ -255,6 +256,11 @@ def plot_beta_maps(state: GameState, cfg: GameConfig, sections: List[Section]):
         ax.tick_params(colors="#cbd5e1")
 
     im1 = ax1.imshow(net, origin="lower", extent=[xs[0], xs[-1], ys[0], ys[-1]], aspect="equal")
+    # 通信境界（論文にある「通信不可能 60°〜120°」を反映：γmin<=60°が通信OK）
+    BI, BO = np.meshgrid(xs, ys)
+    cs = ax1.contour(BI, BO, comm_mask.astype(float), levels=[0.5], linewidths=2.0)
+    cs.collections[0].set_label("通信境界（γmin=60°）")
+    ax1.legend(loc="upper right", frameon=True, fontsize=9)
     ax1.set_title("電力収支  ΔE = 発電 - 消費", color="white", fontsize=12)
     ax1.set_xlabel("βin [deg]", color="white")
     ax1.set_ylabel("βout [deg]", color="white")
@@ -281,7 +287,7 @@ def plot_beta_maps(state: GameState, cfg: GameConfig, sections: List[Section]):
         ax.text(state.beta_in + 1.2, state.beta_out + 1.2, "いま", color="white", fontsize=9,
                 path_effects=[pe.Stroke(linewidth=3, foreground="black"), pe.Normal()])
 
-    fig.text(0.5, 0.01, "緑の境界/面 = 通信OK領域（帆法線が地球方向コーン内＆電力条件）", ha="center", color="white", fontsize=10)
+    fig.text(0.5, 0.01, "緑の境界/面 = 通信OK領域（論文の扱い：通信不可能が 60°〜120° → γmin≤60°でOK）", ha="center", color="white", fontsize=10)
     plt.tight_layout(rect=[0, 0.03, 1, 1])
     return fig
 

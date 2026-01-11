@@ -77,18 +77,26 @@ def make_frame_from_sun(s_hat_world: np.ndarray) -> np.ndarray:
 
 def sail_normal_from_beta(beta_in: float, beta_out: float, s_hat_world: np.ndarray) -> np.ndarray:
     """
-    βin/βout から帆法線 n（世界座標）を作る。
+    βin/βout から帆法線 n（世界座標）を作る（2自由度）。
 
-    βpoint = (βin + βout)/2    : 符号つき（地球指向に効きやすい）
-    βeff   = (|βin|+|βout|)/2  : 絶対値（太陽指向＝発電に効きやすい）
+    ここは“ゲームのつまみ”を定義する場所です。
+    以前は abs() を混ぜていましたが、可逆で分かりやすいように
+    **平均と差**で2自由度を作る定義にしました：
+
+      βpoint = (βin + βout)/2   : 周方向（Yaw）
+      βtilt  = (βin - βout)/2   : 面外（Tilt）
+
+    そして、太陽方向 s を +X とする局所座標で
+      n_local = Rz(βpoint) * Ry(βtilt) * [1,0,0]
+    を作って、世界座標へ戻します。
     """
     beta_point = 0.5 * (beta_in + beta_out)
-    beta_eff = 0.5 * (abs(beta_in) + abs(beta_out))
+    beta_tilt = 0.5 * (beta_in - beta_out)
 
     Rw = make_frame_from_sun(s_hat_world)
     s_local = np.array([1.0, 0.0, 0.0], dtype=float)
 
-    n_local = rot_z(beta_point) @ rot_y(beta_eff) @ s_local
+    n_local = rot_z(beta_point) @ rot_y(beta_tilt) @ s_local
     return unit(Rw @ n_local)
 
 
@@ -98,9 +106,19 @@ def power_from_alpha(alpha_deg: float, P0: float, k: float) -> float:
     return float(P0 * (c ** float(k)))
 
 
-def comm_ok_from_gamma(gamma_deg: float, gamma_max_deg: float, energy: float, Emin: float) -> bool:
-    """通信OK：指向誤差（コーン）＋最低電力"""
-    return (gamma_deg <= gamma_max_deg) and (energy >= Emin)
+def comm_ok_from_gamma(gamma_min_deg: float, ok_max_deg: float) -> bool:
+    """通信OK（幾何のみ）。
+
+    論文にある「通信不可能範囲 60°〜120°」は “エッジオン（90°付近）で隠れる”
+    という状況を表していると解釈できます。
+    そこでここでは両面アンテナを想定し、
+      gamma_min = min(angle(n,e), angle(-n,e)) = arccos(|n·e|)
+    を使います（0〜90°）。
+
+    通信可能  ⇔  gamma_min <= 60°
+    （元の角度γで言うと、60°未満 または 120°超が“可”）
+    """
+    return (gamma_min_deg <= ok_max_deg)
 
 
 def downlink_rate_from_gamma(gamma_deg: float, gamma_max_deg: float, cap: float) -> float:

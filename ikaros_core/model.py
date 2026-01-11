@@ -176,8 +176,8 @@ def init_game(cfg: GameConfig, sections: List[Section], seed: int) -> GameState:
         p_true=p_true,
         p_est=p_est,
         P_cov=P_cov,
-        beta_in=float(cfg.plan_beta_in_deg),
-        beta_out=float(cfg.plan_beta_out_deg),
+        beta_in=float(choose_initial_betas(cfg, sections)[0]),
+        beta_out=float(choose_initial_betas(cfg, sections)[1]),
         maneuvers_left=float(cfg.maneuver_budget),
         log=[],
         phase="play",
@@ -213,13 +213,78 @@ def alpha_gamma_deg(beta_in: float, beta_out: float, state: GameState, cfg: Game
     return alpha, gamma_eff
 
 
+
+def betas_from_normal(n_world: np.ndarray, s_hat_world: np.ndarray) -> Tuple[float, float]:
+    """世界座標の目標法線 n_world を、βin/βout（deg）へ概算変換する。
+
+    ※sail_normal_from_beta() の“平均と差”定義に合わせた逆変換です。
+      n_local = Rz(βpoint) * Ry(βtilt) * [1,0,0]
+      βin  = βpoint + βtilt
+      βout = βpoint - βtilt
+    """
+    Rw = make_frame_from_sun(s_hat_world)
+    n_local = (Rw.T @ unit(n_world)).astype(float)
+
+    # 数式：n_local = [cosθ cosψ, cosθ sinψ, -sinθ]
+    beta_point = math.degrees(math.atan2(float(n_local[1]), float(n_local[0])))
+    beta_tilt = math.degrees(math.atan2(-float(n_local[2]), math.hypot(float(n_local[0]), float(n_local[1]))))
+
+    beta_in = beta_point + beta_tilt
+    beta_out = beta_point - beta_tilt
+    return float(beta_in), float(beta_out)
+
+
+def choose_initial_betas(cfg: GameConfig, sections: List[Section]) -> Tuple[float, float]:
+    """初期に“リンクが張れている”状態を作るためのβを自動設定。
+
+    両面アンテナ前提＆通信可否は幾何のみ（γmin <= 60°）なので、
+    初期は「通信を満たしつつ、できるだけ発電も残す」方向を狙います。
+    """
+    n = len(sections)
+    sec0 = sections[0]
+    e = ephem_at_day(sec0.t_day, cfg.eph)
+    r_sc = sc_nominal_at_index(0, n, cfg.eph)["sc"]
+    s_hat, e_hat = compute_dirs(r_sc, e["earth"])
+
+    # 目標法線を n = unit((1-w) s + w e) でスイープし、
+    # 通信OKを満たす中で発電（= αが小さい）を最大化する。
+    best = None
+    for w in np.linspace(0.0, 1.0, 41):
+        n_world = unit((1.0 - float(w)) * s_hat + float(w) * e_hat)
+        bi, bo = betas_from_normal(n_world, s_hat)
+
+        # UIレンジに収める（スライダ範囲と一致）
+        bi = float(np.clip(bi, -35.0, 35.0))
+        bo = float(np.clip(bo, -35.0, 35.0))
+
+        # 評価（stateなしで直接）
+        n_hat = sail_normal_from_beta(bi, bo, s_hat)
+        alpha = angle_deg(n_hat, s_hat)
+        gamma = angle_bisided_deg(n_hat, e_hat)  # 両面アンテナ
+        ok = comm_ok_from_gamma(gamma, cfg.comm_cone_deg)
+
+        if ok:
+            # alphaが小さい（=cosが大きい）ほど良い
+            score = -alpha
+            if (best is None) or (score > best[0]):
+                best = (score, bi, bo)
+
+    if best is not None:
+        return float(best[1]), float(best[2])
+
+    # どうしても無理なら、地球寄りに倒す
+    bi, bo = betas_from_normal(e_hat, s_hat)
+    bi = float(np.clip(bi, -35.0, 35.0))
+    bo = float(np.clip(bo, -35.0, 35.0))
+    return bi, bo
+
 def comm_ok(beta_in: float, beta_out: float, state: GameState, cfg: GameConfig, sections: List[Section]) -> bool:
     """通信OK（角度モデル）。NO-LINKは常にNG（演出）"""
     sec = sections[min(state.k, len(sections) - 1)]
     if not sec.uplink_possible:
         return False
     alpha, gamma = alpha_gamma_deg(beta_in, beta_out, state, cfg, sections)
-    return comm_ok_from_gamma(gamma, cfg.comm_cone_deg, state.energy, cfg.energy_min_for_comm)
+    return comm_ok_from_gamma(gamma, cfg.comm_cone_deg)
 
 
 def power_gen(beta_in: float, beta_out: float, state: GameState, cfg: GameConfig, sections: List[Section]) -> Tuple[float, float, float]:

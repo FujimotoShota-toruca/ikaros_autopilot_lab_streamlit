@@ -78,7 +78,7 @@ class GameConfig:
     # 通信（角度モデル）
     # -------------------------
     # 地球方向 e と帆法線 n のなす角 γ がこの範囲内なら通信OK（deg）
-    comm_cone_deg: float = 20.0
+    comm_cone_deg: float = 60.0
 
     # -------------------------
     # 電力（角度モデル）
@@ -89,7 +89,7 @@ class GameConfig:
 
     energy_max: float = 200.0
     energy_init: float = 140.0
-    energy_min_for_comm: float = 30.0
+    energy_min_for_comm: float = 0.0  # ※通信可否は幾何のみで判定
 
     # 常時消費（機器）
     base_load: float = 70.0

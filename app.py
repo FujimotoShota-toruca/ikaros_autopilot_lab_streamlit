@@ -34,7 +34,7 @@ from ikaros_core.plots import plot_bplane, plot_orbits_2d_nominal, plot_beta_map
 # -----------------------------
 st.set_page_config(page_title="IKAROS B-plane Darts (Angle Model)", layout="wide")
 st.title("🎯 IKAROS：B-plane ダーツ（角度モデル版）")
-st.caption("通信・発電は『帆法線 n と、太陽方向 s・地球方向 e のなす角（α,γ）』だけで決めます。")
+st.caption("通信・発電は『帆法線 n と、太陽方向 s・地球方向 e のなす角（α,γ）』だけで決めます。通信は論文の記述に合わせ、通信不可能が 60°〜120°になるよう（γmin≤60°でOK）にしています。")
 
 
 cfg = GameConfig()
@@ -64,7 +64,8 @@ with st.sidebar:
     st.markdown(
         """
 - **発電**：α = angle(n, 太陽方向 s) が小さいほど↑（cos）  
-- **通信**：γ = angle(n, 地球方向 e) が小さいほどOK（コーン）  
+- **通信**：論文の扱いに合わせて、**通信不可能が 60°〜120°**（エッジオン付近）になるようにモデル化  
+  - 両面アンテナ想定なので **γmin = arccos(|n·e|)**（0〜90°）を使い、**γmin ≤ 60°** なら通信OK  
 - つまり **“太陽を向く” vs “地球を向く”** のトレードオフ  
 - SRPは弱いので、B-planeは“調整ゲーム”  
 """
