@@ -1,17 +1,5 @@
-\
-# Python
 __pycache__/
-*.py[cod]
-*.so
-*.egg-info/
-dist/
-build/
 .venv/
 venv/
-
-# Streamlit
 .streamlit/secrets.toml
-
-# OS
 .DS_Store
-Thumbs.db

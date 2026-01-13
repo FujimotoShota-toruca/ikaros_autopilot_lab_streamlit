@@ -1,38 +1,16 @@
 \
-# Game design notes (ideas)
+# ゲーム性アイデア（メモ）
 
-This prototype is intentionally minimal. Here are upgrade ideas that preserve “fun + learning”:
+- 難易度
+  - かんたん：通信制約ゆるい、ブラックアウトなし
+  - ふつう：通信+でんき制約あり
+  - むずかしい：コマンド遅延、外乱大きめ、許容範囲小さめ
 
-## Turn structure (ops feeling)
+- スコア
+  - ゴールに近いほど高得点
+  - でんきをたくさん確保（安全運用）
+  - 通信できた回数（運用のうまさ）
 
-- Each turn = 2 weeks
-  - First half: attitude command
-  - Second half: orbit determination (if comm available)
-
-Delayed feedback is one of the most educational parts.
-
-## Missions & difficulty
-
-- Easy: always-on comm, no blackout window, generous target tolerance
-- Normal: comm angle gate + power gate
-- Hard: add blackout windows + command delay + bigger disturbances
-
-## Scoring
-
-- Primary: final distance to target on B-plane
-- Secondary:
-  - number of comm opportunities used
-  - total attitude change magnitude (proxy for consumables)
-  - maximum sun angle margin (power safety)
-
-## UI upgrades
-
-- Show predicted impact vector (“if you command this, expected move is …”)
-- Show uncertainty ellipse for x_hat
-- Add a “timeline” bar of comm windows / blackout windows
-
-## Physics upgrades (optional)
-
-- Replace C_k with precomputed STM-based matrices
-- Add coupling from attitude -> sun angle (power) and/or antenna pointing
-- Add “sail efficiency estimation” mini-game (OD improves it gradually)
+- 追加UI
+  - “いまのβならどっちへ動く？” の矢印を大きく
+  - 不確かさ楕円を “なぜ広がる？” と説明

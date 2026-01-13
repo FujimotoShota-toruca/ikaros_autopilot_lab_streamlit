@@ -1,49 +1,26 @@
 \
-# Customization guide
+# カスタマイズ（もう少し本物っぽくする）
 
-You can replace the toy schedules with your own precomputed tables, while keeping the Streamlit UI.
+この試作は “カンタン模型” です。ここを差し替えると、本物っぽくできます。
 
-## 1) Replace sun/earth angles with `data/angles_schedule.json`
+## 1) 2D軌道図を自分の計算にする
+いまは、地球と金星を「まるい道（円）」で回す模型です。
+もしあなたが SPICE / Lambert / 伝播計算をしているなら、
 
-Create a JSON file:
+- 地球の位置（x,y）
+- 金星の位置（x,y）
+- IKAROSの位置（x,y）
 
-```json
-[
-  {"turn": 0, "day": 0,  "sun_angle_deg": 35.0, "earth_angle_deg": 120.0},
-  {"turn": 1, "day": 14, "sun_angle_deg": 36.2, "earth_angle_deg": 130.5}
-]
-```
+を、日付（またはターン）ごとに JSON にして読み込む形にできます。
 
-The app will pick the closest entry by `day`.
+（ここは次の改造ポイントです。必要ならこちらで読み込みコードを追加します。）
 
-## 2) Replace sensitivity matrices with `data/sensitivity_schedule.json`
+## 2) β→B-plane の効き（感度行列）を差し替える
+いまは `base_sensitivity(turn)` が “それっぽい行列” を作っています。
 
-Create a JSON file:
+あなたのSTM（状態遷移行列）から、ターンごとの 2×2 行列 C_k を作って、
+`base_sensitivity` を JSON 読み込みに置き換えると一気に本物に近づきます。
 
-```json
-[
-  {"turn": 0, "C": [[1.0, 0.3], [-0.2, 0.9]]},
-  {"turn": 1, "C": [[1.1, 0.2], [-0.1, 1.0]]}
-]
-```
-
-The app will use the entry whose `turn` matches the current turn, and scale it by the hidden
-efficiency factor `k_true` (you can remove scaling if you want).
-
-## 3) What if I want STM-based mapping?
-
-A practical pipeline for the “real” version:
-
-1. Pick a reference Earth–Venus transfer and a nominal attitude schedule.
-2. Propagate variational equations / compute STM segments.
-3. Build a mapping from small changes in β-in/out to changes in B-plane coordinates.
-4. Export per-turn matrices into `sensitivity_schedule.json`.
-
-This preserves the **fast UI loop** while keeping the physics behind the scenes.
-
-## 4) Knobs that dramatically change gameplay
-
-- Increase OD noise -> more “ops pain”
-- Add command delay (execute u_k only after next comm window)
-- Limit total |Δβ| budget per mission
-- Add score terms: “hit target”, “minimize RCS”, “maximize contact time”
+## 3) 推定（OD）を強くする
+今は “混ぜるだけ” の更新です。
+EKF/UKF にすると、楕円の意味がもっと本格的になります。

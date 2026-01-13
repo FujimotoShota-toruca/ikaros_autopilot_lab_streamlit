@@ -1,20 +1,20 @@
 \
-# IKAROS-GO (prototype)
+# IKAROS-GO（試作）
 
-A lightweight, Streamlit-deployable parody/learning game inspired by **HTV-GO!**:
-you “pilot” a solar-sail spacecraft (IKAROS-like) by adjusting attitude angles
-(β-in / β-out) to steer the **Venus B-plane** targeting point, while experiencing
-operational constraints like **communications windows** and **power limits**.
+Streamlitで動く、IKAROSっぽい「うごかして学ぶ」ゲームの試作品です。
 
-This repository is intentionally **simple** (no full orbit propagation) so you can
-deploy quickly and iterate on the gameplay logic.
+- **β_in / β_out**（ベータ）を動かして、IKAROSの向きを変えます
+- すると、金星での **B-plane（ねらいの平面）** の点が少しずつ動きます
+- でも、いつも自由にできるわけではなくて…
+  - **でんき（太陽からのかたむき）**
+  - **通信（地球に向けられる角度）**
+  がじゃまをします（本物の運用っぽさ）
 
-> Want to make it more “real”? Replace the toy schedules with your precomputed
-> state transition / sensitivity data (see `docs/customize.md`).
+> これは “教育用のカンタン模型” です。あとからあなたの計算したデータに差し替えて、本物っぽくできます。
 
 ---
 
-## Quick start (local)
+## すぐ動かす（ローカル）
 
 ```bash
 pip install -r requirements.txt
@@ -23,55 +23,43 @@ streamlit run app.py
 
 ---
 
-## Deploy on Streamlit Community Cloud (fast path)
+## Streamlit Community Cloudでデプロイ（はやい）
 
-1. Push this repo to GitHub.
-2. Go to Streamlit Community Cloud and create a new app from the repo.
-3. Set:
-   - **Main file path**: `app.py`
-4. Deploy.
-
-No extra config is required.
+1. このフォルダを GitHub にアップロード
+2. Streamlit Community Cloud で New app → Repo を選ぶ
+3. **Main file path** を `app.py` にする
+4. Deploy
 
 ---
 
-## What’s inside
+## 画面の見かた（小学生むけ）
 
-- `app.py` — the Streamlit app (turn-based guidance game)
-- `requirements.txt` — minimal Python dependencies
-- `docs/math.md` — the simplified math model (B-plane state + sensitivity)
-- `docs/customize.md` — how to feed real schedules (`data/*.json`)
-- `docs/game_design.md` — gameplay ideas & knobs
-- `data/` — placeholder examples of schedule files
+- **B-plane（ねらい）**  
+  点が “いまの場所（よそう）”。  
+  楕円が “つぎに行きそうな ばらつき（よそう）”。
 
----
+- **太陽系の図（いまどこ？）**  
+  太陽・地球・金星・IKAROS が 2D 図で見えます。  
+  ※これは “それっぽい模型” の図です。
 
-## Model (prototype)
-
-- State: `x_k = [B_T, B_R]^T` (km), a 2D point on the B-plane.
-- Control: `u_k = [Δβ_in, Δβ_out]^T` (deg), attitude change commands.
-- Dynamics (toy):
-  ```
-  x_{k+1} = x_k + C_k u_k + w_k
-  ```
-- Constraints (simplified):
-  - Power: sun angle must be `< 45°`
-  - Comms: earth aspect angle in `[0,60]` or `[120,180]` degrees
-  - Optional blackout event window (toy) to emulate “no-link” periods
-
-See `docs/math.md` for details.
+- **βマップ（通信とでんき）**  
+  βの場所ごとに、
+  - でんき（背景）
+  - 通信できる場所（太い線）
+  が見えます。
 
 ---
 
-## References (starting points)
+## 参考（読み物）
 
-- ISSFD 2011 paper (IKAROS Venus B-plane targeting operations / guidance concepts):
-  - https://issfd.org/ISSFD_2011/S3-Interplanetary.Mission.Design.1-IMD1/S3_P6_ISSFD22_PF_075.pdf
-- J-STAGE paper (IKAROS comm/antenna operational constraints, etc.):
-  - https://www.jstage.jst.go.jp/article/kjsass/61/4/61_KJ00008636303/_pdf/-char/ja
+- ISSFD 2011: IKAROS の金星B-planeターゲティング運用など  
+  https://issfd.org/ISSFD_2011/S3-Interplanetary.Mission.Design.1-IMD1/S3_P6_ISSFD22_PF_075.pdf
+
+- J-STAGE: IKAROS の通信・アンテナ運用など  
+  https://www.jstage.jst.go.jp/article/kjsass/61/4/61_KJ00008636303/_pdf/-char/ja
 
 ---
 
-## License
+## ライセンス
 
-MIT (see `LICENSE`).
+MIT（`LICENSE` を見てください）
