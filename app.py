@@ -1,246 +1,309 @@
-"""
-Streamlit エントリーポイント（UI層）
-
-構成（可読性重視）
-- core/config.py    : パラメータ
-- core/attitude.py  : 角度モデル（n,s,eとα,γ）
-- core/model.py     : 状態遷移（運用・OD・リソース）
-- core/plots.py     : 図（B-plane / βマップ / 軌道 / 3D）
-- core/fonts.py     : 日本語フォント
-
-“角度だけ”で通信・発電を定義したバージョンです。
-"""
+\
+# app.py
+# IKAROS-GO (prototype) — a lightweight B-plane guidance “ops experience” game
+#
+# How to use:
+#   streamlit run app.py
+#
+# You can later replace the toy schedules with real precomputed tables:
+#   - data/angles_schedule.json
+#   - data/sensitivity_schedule.json
+#
+# See docs/math.md and docs/customize.md for details.
 
 from __future__ import annotations
 
-import pandas as pd
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import plotly.graph_objects as go
 import streamlit as st
 
-import matplotlib
-matplotlib.use("Agg")  # Streamlit上での描画安定化
-
-from ikaros_core.config import GameConfig
-from ikaros_core.fonts import setup_japanese_font, default_bundled_font_path
-from ikaros_core.model import (
-    build_sections, init_game, execute_section, score_game,
-    alpha_gamma_deg, comm_ok, power_gen,
-    GameState,
-)
-from ikaros_core.plots import plot_bplane, plot_orbits_2d_nominal, plot_beta_maps, geometry_3d_figure
+st.set_page_config(page_title="IKAROS-GO (prototype)", layout="wide")
 
 
 # -----------------------------
-# 画面設定
+# Configuration
 # -----------------------------
-st.set_page_config(page_title="IKAROS B-plane Darts (Angle Model)", layout="wide")
-st.title("🎯 IKAROS：B-plane ダーツ（角度モデル版）")
-st.caption("通信・発電は『帆法線 n と、太陽方向 s・地球方向 e のなす角（α,γ）』だけで決めます。通信は論文の記述に合わせ、通信不可能が 60°〜120°になるよう（γmin≤60°でOK）にしています。")
+
+DATA_DIR = Path(__file__).parent / "data"
 
 
-cfg = GameConfig()
-sections = build_sections()
+@dataclass
+class GameConfig:
+    n_turns: int = 14              # 14 turns * 2 weeks = 28 weeks
+    turn_days: int = 14
+    target_bt_br_km: Tuple[float, float] = (0.0, 0.0)
+    tolerance_km: float = 30.0
 
-# フォント（同梱）
-font_name, font_path = setup_japanese_font(default_bundled_font_path())
+    # Constraints (toy defaults)
+    sun_angle_max_deg: float = 45.0
+
+    # Slider bounds for delta-beta controls
+    beta_step_max_deg: float = 15.0
+    beta_step_res_deg: float = 0.5
+
+    # Noise levels (toy)
+    process_noise_km: float = 3.0
+    measurement_noise_km: float = 6.0
+    init_estimate_noise_km: float = 10.0
+
+
+CFG = GameConfig()
 
 
 # -----------------------------
-# サイドバー（設定＋説明）
+# Helpers: constraints & schedules
 # -----------------------------
+
+def comm_ok(earth_aspect_angle_deg: float) -> bool:
+    """
+    Communication constraint (simplified):
+      Earth aspect angle within [0, 60] or [120, 180] degrees => comm possible.
+    """
+    a = abs(earth_aspect_angle_deg) % 360.0
+    a = a if a <= 180.0 else 360.0 - a
+    return (0.0 <= a <= 60.0) or (120.0 <= a <= 180.0)
+
+
+def no_link_event(day: float) -> bool:
+    """
+    Toy blackout window to emulate unavoidable no-link periods.
+    Replace/remove if you use a real schedule.
+    """
+    return 100.0 <= day <= 130.0
+
+
+def load_angles_schedule() -> Optional[List[Dict[str, float]]]:
+    """
+    Optional: load nominal sun/earth angles from JSON (one entry per turn).
+    Format:
+      [
+        {"turn": 0, "day": 0, "sun_angle_deg": 35.0, "earth_angle_deg": 120.0},
+        ...
+      ]
+    """
+    p = DATA_DIR / "angles_schedule.json"
+    if not p.exists():
+        return None
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        return None
+    return data
+
+
+def load_sensitivity_schedule() -> Optional[List[Dict[str, object]]]:
+    """
+    Optional: load sensitivity matrices C_k from JSON (one entry per turn).
+    Format:
+      [
+        {"turn": 0, "C": [[1.0, 0.3], [-0.2, 0.9]]},
+        ...
+      ]
+    """
+    p = DATA_DIR / "sensitivity_schedule.json"
+    if not p.exists():
+        return None
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        return None
+    return data
+
+
+ANGLES_SCHEDULE = load_angles_schedule()
+SENS_SCHEDULE = load_sensitivity_schedule()
+
+
+def nominal_angles(day: float) -> Tuple[float, float]:
+    """
+    Returns (sun_angle_deg, earth_aspect_angle_deg) for the current day.
+    If angles_schedule.json exists, uses it by nearest turn; otherwise uses toy sinusoids.
+    """
+    if ANGLES_SCHEDULE:
+        # Find nearest by day (or use turn index if present)
+        # Since the game is turn-based, we'll use the closest entry by day.
+        best = min(ANGLES_SCHEDULE, key=lambda d: abs(float(d.get("day", 0.0)) - day))
+        return float(best["sun_angle_deg"]), float(best["earth_angle_deg"])
+
+    # Toy schedules (replace with your precomputed timeline)
+    sun = 35.0 + 8.0 * np.sin(2.0 * np.pi * day / 180.0)
+    earth = 90.0 + 70.0 * np.sin(2.0 * np.pi * day / 120.0)
+    return float(sun), float(earth)
+
+
+def make_Ck(turn: int, k_true: float) -> np.ndarray:
+    """
+    Sensitivity matrix mapping u=[Δβ_in, Δβ_out] to x=[ΔB_T, ΔB_R] (toy).
+    If sensitivity_schedule.json exists, uses it and scales by k_true.
+    """
+    if SENS_SCHEDULE:
+        # Match by "turn"
+        entry = next((d for d in SENS_SCHEDULE if int(d.get("turn", -1)) == int(turn)), None)
+        if entry is not None:
+            C = np.array(entry["C"], dtype=float)
+            return k_true * C
+
+    # Toy: controllability improves in later turns
+    gain = (0.6 + 0.06 * turn) * k_true
+    return gain * np.array([[1.0, 0.3],
+                            [-0.2, 0.9]], dtype=float)
+
+
+# -----------------------------
+# Session state
+# -----------------------------
+
+def init_state(seed: int = 2) -> None:
+    rng = np.random.default_rng(seed)
+
+    st.session_state.k = 0
+    st.session_state.day = 0.0
+
+    # True & estimated state on B-plane (km)
+    st.session_state.x_true = np.array([120.0, -80.0], dtype=float)
+    st.session_state.x_hat = st.session_state.x_true + rng.normal(0.0, CFG.init_estimate_noise_km, size=2)
+
+    # Hidden sail efficiency and its estimate
+    st.session_state.k_true = float(rng.uniform(0.75, 1.25))
+    st.session_state.k_hat = 1.0
+
+    st.session_state.hist = []  # list of dict logs
+    st.session_state.rng_seed = seed
+
+
+if "k" not in st.session_state:
+    init_state()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+
+st.title("IKAROS-GO (prototype) — B-plane guidance with ops constraints")
+
 with st.sidebar:
-    st.header("設定")
-    seed = st.number_input("シード（同じ問題を再現）", min_value=1, max_value=999999, value=42, step=1)
-    show_truth = st.toggle("先生モード：真値を表示", value=False)
+    st.header("Settings")
+    seed = st.number_input("Random seed", min_value=0, max_value=9999, value=int(st.session_state.rng_seed), step=1)
+    if st.button("Reset mission"):
+        init_state(int(seed))
+        st.rerun()
 
-    st.divider()
-    st.subheader("日本語フォント")
-    if font_name:
-        st.caption(f"同梱フォントを使用：{font_name}")
-    else:
-        st.warning("同梱フォントが読めず、日本語が□になる可能性があります。")  # なるべく避けたい…！
+    st.markdown("---")
+    st.caption("Tip: put real schedules in data/*.json to replace the toy model.")
+    st.caption("See docs/customize.md.")
 
-    st.divider()
-    st.subheader("学習ポイント（角度モデル）")
-    st.markdown(
-        """
-- **発電**：α = angle(n, 太陽方向 s) が小さいほど↑（cos）  
-- **通信**：論文の扱いに合わせて、**通信不可能が 60°〜120°**（エッジオン付近）になるようにモデル化  
-  - 両面アンテナ想定なので **γmin = arccos(|n·e|)**（0〜90°）を使い、**γmin ≤ 60°** なら通信OK  
-- つまり **“太陽を向く” vs “地球を向く”** のトレードオフ  
-- SRPは弱いので、B-planeは“調整ゲーム”  
-"""
+colL, colR = st.columns([1.2, 0.8], gap="large")
+
+# Current constraints
+sun_angle, earth_angle = nominal_angles(st.session_state.day)
+link_ok = (not no_link_event(st.session_state.day)) and (sun_angle <= CFG.sun_angle_max_deg) and comm_ok(earth_angle)
+
+# Control panel
+with colR:
+    st.subheader("Control")
+    st.caption(f"Turn {st.session_state.k + 1}/{CFG.n_turns}  |  Day {st.session_state.day:.0f}")
+
+    c1, c2 = st.columns(2)
+    c1.metric("Sun angle (deg)", f"{sun_angle:.1f}", help=f"Power constraint: must be < {CFG.sun_angle_max_deg:.0f}°")
+    c2.metric("Earth aspect angle (deg)", f"{earth_angle:.1f}", help="Comms when 0–60° or 120–180° (simplified)")
+
+    st.metric("LINK", "OK ✅" if link_ok else "NO ❌")
+
+    beta_in = st.slider("Δβ_in (deg)", -CFG.beta_step_max_deg, CFG.beta_step_max_deg, 0.0, CFG.beta_step_res_deg,
+                        disabled=not link_ok)
+    beta_out = st.slider("Δβ_out (deg)", -CFG.beta_step_max_deg, CFG.beta_step_max_deg, 0.0, CFG.beta_step_res_deg,
+                         disabled=not link_ok)
+
+    step = st.button("Execute 2-week cycle", type="primary", disabled=(st.session_state.k >= CFG.n_turns))
+
+    # Dynamics step
+    if step:
+        rng = np.random.default_rng(int(st.session_state.rng_seed) + int(st.session_state.k) + 100)
+
+        u = np.array([beta_in, beta_out], dtype=float) if link_ok else np.array([0.0, 0.0], dtype=float)
+        Ck = make_Ck(st.session_state.k, float(st.session_state.k_true))
+        w = rng.normal(0.0, CFG.process_noise_km, size=2)
+
+        # True propagation on B-plane (toy)
+        st.session_state.x_true = st.session_state.x_true + Ck @ u + w
+
+        # OD update only if we have comm link
+        if link_ok:
+            meas = st.session_state.x_true + rng.normal(0.0, CFG.measurement_noise_km, size=2)
+            st.session_state.x_hat = 0.6 * st.session_state.x_hat + 0.4 * meas
+            st.session_state.k_hat += 0.15 * (float(st.session_state.k_true) - float(st.session_state.k_hat))
+
+        # Log
+        st.session_state.hist.append({
+            "turn": int(st.session_state.k),
+            "day": float(st.session_state.day),
+            "u_in_deg": float(u[0]),
+            "u_out_deg": float(u[1]),
+            "BT_hat_km": float(st.session_state.x_hat[0]),
+            "BR_hat_km": float(st.session_state.x_hat[1]),
+            "link": bool(link_ok),
+            "sun_deg": float(sun_angle),
+            "earth_deg": float(earth_angle),
+            "k_hat": float(st.session_state.k_hat),
+        })
+
+        # Advance time
+        st.session_state.k += 1
+        st.session_state.day += float(CFG.turn_days)
+
+        if st.session_state.k >= CFG.n_turns:
+            st.success("Mission end! (prototype)")
+
+        st.rerun()
+
+
+# B-plane plot
+with colL:
+    st.subheader("B-plane")
+
+    target = np.array(CFG.target_bt_br_km, dtype=float)
+    tol = float(CFG.tolerance_km)
+
+    fig = go.Figure()
+
+    # Target tolerance circle (toy)
+    th = np.linspace(0, 2 * np.pi, 240)
+    fig.add_trace(go.Scatter(
+        x=target[0] + tol * np.cos(th),
+        y=target[1] + tol * np.sin(th),
+        mode="lines",
+        name="target tolerance",
+    ))
+
+    # Past estimated path
+    if st.session_state.hist:
+        xs = [h["BT_hat_km"] for h in st.session_state.hist]
+        ys = [h["BR_hat_km"] for h in st.session_state.hist]
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="estimate path"))
+
+    # Current estimate
+    fig.add_trace(go.Scatter(
+        x=[float(st.session_state.x_hat[0])],
+        y=[float(st.session_state.x_hat[1])],
+        mode="markers",
+        name="current estimate",
+    ))
+
+    fig.update_layout(
+        xaxis_title="B_T (km)",
+        yaxis_title="B_R (km)",
+        height=560,
+        margin=dict(l=10, r=10, t=10, b=10),
+        showlegend=True,
     )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    st.plotly_chart(fig, use_container_width=True)
 
-
-# -----------------------------
-# セッション状態
-# -----------------------------
-seed_int = int(seed)
-STATE_KEY = "bplane_state_angle_v1"
-SEED_KEY = "bplane_seed_angle_v1"
-PAGE_KEY = "page_angle_v1"
-
-if STATE_KEY not in st.session_state or st.session_state.get(SEED_KEY) != seed_int:
-    st.session_state[STATE_KEY] = init_game(cfg, sections, seed=seed_int)
-    st.session_state[SEED_KEY] = seed_int
-    st.session_state[PAGE_KEY] = "Play"
-
-state: GameState = st.session_state[STATE_KEY]
-
-
-def rerun():
-    (st.rerun() if hasattr(st, "rerun") else st.experimental_rerun())
-
-
-def reset():
-    st.session_state[STATE_KEY] = init_game(cfg, sections, seed=seed_int)
-    st.session_state[PAGE_KEY] = "Play"
-    rerun()
-
-
-if state.phase == "result":
-    st.session_state[PAGE_KEY] = "Result"
-
-page = st.radio("ページ", ["Play", "Result"], horizontal=True, index=(0 if st.session_state[PAGE_KEY] == "Play" else 1))
-st.session_state[PAGE_KEY] = page
-
-
-# -----------------------------
-# Play
-# -----------------------------
-def render_play():
-    sec = sections[min(state.k, len(sections) - 1)]
-
-    # 現在の角度（α,γ）と通信判定
-    alpha, gamma = alpha_gamma_deg(state.beta_in, state.beta_out, state, cfg, sections)
-    ok = comm_ok(state.beta_in, state.beta_out, state, cfg, sections)
-    Pgen, _, _ = power_gen(state.beta_in, state.beta_out, state, cfg, sections)
-
-    st.progress(min(1.0, state.k / len(sections)))
-    st.write(f"進捗：**{state.k}/{len(sections)}** セクション完了（全{len(sections)}）  |  現在：**{sec.name}**（t≈{sec.t_day:.0f}日）")
-
-
-    # 進めるボタンは上側に置く（操作の主役なので）
-    a1, a2, a3, a4, a5, a6 = st.columns([1.0, 1.0, 1.0, 1.0, 1.2, 1.5])
-    with a1:
-        st.metric("通信", "🟢OK" if ok else "🔴NG")
-    with a2:
-        st.metric("α（太陽）", f"{alpha:.1f}°")
-    with a3:
-        st.metric("γ（地球・両面）", f"{gamma:.1f}°")
-    with a4:
-        st.metric("発電Pgen", f"{Pgen:.1f}")
-    with a5:
-        st.metric("バッテリ", f"{state.energy:.0f}/{cfg.energy_max:.0f}")
-    with a6:
-        btn_next = st.button("▶ このセクションを実行（進める）", use_container_width=True, disabled=(state.phase == "result"))
-        btn_reset = st.button("🔁 リセット", use_container_width=True)
-
-    if btn_reset:
-        reset()
-    if btn_next:
-        execute_section(state, cfg, sections)
-        rerun()
-
-    st.subheader("B-plane（メイン）")
-    st.pyplot(plot_bplane(state, cfg, sections, show_truth=show_truth), use_container_width=True)
-
-    # NO-LINKの意味を明確化
-    if not sec.uplink_possible:
-        st.error("このセクションは NO-LINK：操作できない（Δβ=0固定）。通信もNG扱い。")  # 演出としてのブラックアウト
-    else:
-        if ok:
-            st.success("通信OK：DL可能（中心ほどDL↑）。通信コストも乗ります。")
-        else:
-            st.warning("通信NG：DLできません（通信コストなし）。")
-
-
-    left, right = st.columns([1.0, 1.0], gap="large")
-
-
-    with left:
-        st.subheader("位置関係（2D軌道図：ノミナル）")
-        st.pyplot(plot_orbits_2d_nominal(state, cfg, sections), use_container_width=True)
-
-        # ライブ推移（変化しない現象を避けるため、軸を明示）
-        if state.log:
-            df = pd.DataFrame(state.log)
-            st.subheader("ライブ推移（主要）")
-            st.caption("距離は『ターゲットからどれだけズレているか』。α/γは『太陽/地球との角度』です。")
-            st.line_chart(df.set_index("turn")[["dist_to_target_km"]], height=170)
-            st.line_chart(df.set_index("turn")[["energy", "alpha_sun_deg", "gamma_earth_deg"]], height=220)
-
-
-    with right:
-        st.subheader("βin×βout マップ（角度モデル）")
-        st.pyplot(plot_beta_maps(state, cfg, sections), use_container_width=True)
-
-        st.subheader("幾何（3D表示）")
-        st.caption("太陽方向 s / 地球方向 e / 帆法線 n を同時表示（ドラッグで回転）。")
-        st.plotly_chart(geometry_3d_figure(state, cfg, sections), use_container_width=True)
-
-        st.subheader("コマンド（βin / βout）")
-        cA, cB = st.columns(2)
-        with cA:
-            bi = st.slider("βin [deg]", -35.0, 35.0, float(state.beta_in), 1.0)
-        with cB:
-            bo = st.slider("βout [deg]", -35.0, 35.0, float(state.beta_out), 1.0)
-
-        state.beta_in = float(bi)
-        state.beta_out = float(bo)
-
-
-    if state.log:
-        with st.expander("ログ（必要なら開く）", expanded=False):
-            st.dataframe(pd.DataFrame(state.log), use_container_width=True, hide_index=True)
-
-
-# -----------------------------
-# Result
-# -----------------------------
-def render_result():
-    st.header("📊 リザルト")
-    score, bd = score_game(state, cfg)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("スコア", f"{score:.0f}")
-    c2.metric("最終距離（B-plane）", f"{bd['final_distance_km']:.0f} km")
-    c3.metric("データ下ろし", f"{bd['science_downlinked']:.0f}")
-    c4.metric("電力残", f"{bd['energy_left']:.0f}")
-
-    st.subheader("B-plane（最終）")
-    st.pyplot(plot_bplane(state, cfg, sections, show_truth=True), use_container_width=True)
-
-    st.subheader("位置関係（2D軌道図：ノミナル）")
-    st.pyplot(plot_orbits_2d_nominal(state, cfg, sections), use_container_width=True)
-
-    if state.log:
-        df = pd.DataFrame(state.log)
-        st.subheader("推移まとめ（項目別）")
-        cA, cB = st.columns(2)
-        with cA:
-            st.caption("距離：ターゲットからのズレ")
-            st.line_chart(df.set_index("turn")[["dist_to_target_km"]], height=170)
-            st.caption("バッテリ残量")
-            st.line_chart(df.set_index("turn")[["energy"]], height=170)
-            st.caption("通信指向（γ：両面最小角）")
-            st.line_chart(df.set_index("turn")[["gamma_earth_deg"]], height=170)
-        with cB:
-            st.caption("太陽指向（α）")
-            st.line_chart(df.set_index("turn")[["alpha_sun_deg"]], height=170)
-            st.caption("データ：バッファ量")
-            st.line_chart(df.set_index("turn")[["data_buffer"]], height=170)
-            st.caption("データ：損失（累積）")
-            st.line_chart(df.set_index("turn")[["data_lost_total"]], height=170)
-
-    if st.button("🔁 もう一回（リセット）", use_container_width=True):
-        reset()
-
-
-# -----------------------------
-# ルーティング
-# -----------------------------
-if page == "Play":
-    render_play()
-else:
-    render_result()
+st.divider()
+st.subheader("Log")
+st.dataframe(st.session_state.hist, use_container_width=True)
