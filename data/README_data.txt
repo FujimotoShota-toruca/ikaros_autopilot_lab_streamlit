@@ -1,1 +1,2 @@
-ここに将来: 軌道/幾何/感度行列などのデータ(JSON)を置いて差し替える予定。
+orbit_schedule.json と sensitivity_schedule.json を置くと、それを読みます。
+まずは *.example.json をコピーして使ってください。

@@ -1,60 +1,48 @@
-\
 # app.py
-# IKAROS-GO (prototype) — Streamlit app
+# IKAROS-GO (prototype) — Streamlit app (v3: JSONデータ差し替え対応)
 #
-# ねらい:
-#  - B-plane(ねらいの平面)で「どこに行くか」を見える化
-#  - β_in / β_out を動かしたときの「つぎの場所（よそう）」を予測楕円で表示
-#  - 太陽・地球・金星・IKAROS の 2D 図で「いまどこ？」を表示
-#  - 軌道(カンタン模型)から幾何(きか)を計算し、β平面で「通信」と「でんき」を見える化
-#
-# 注意:
-#  - これは “教育用のカンタン模型” です（本物の軌道伝播ではありません）
-#  - あとから data/*.json に差し替えて “本物寄り” にできます（docs/customize.md）
+# ✅ data/orbit_schedule.json があれば、2D軌道図と幾何(太陽/地球方向)をそのデータで計算
+# ✅ data/sensitivity_schedule.json があれば、β→B-plane の効き(C_k)をそのデータで置き換え
+# ✅ どちらも無い場合は、カンタン模型（トイ）で動く
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 
+DATA_DIR = Path(__file__).parent / "data"
+
 
 # -----------------------------
 # 設定
 # -----------------------------
-
 @dataclass
 class GameConfig:
-    # 1ターン=2週間（運用っぽさ）
     n_turns: int = 14
     turn_days: int = 14
 
-    # B-plane 目標
     target_bt_br_km: Tuple[float, float] = (0.0, 0.0)
     tolerance_km: float = 30.0
 
-    # βスライダー
     beta_max_deg: float = 15.0
     beta_step_deg: float = 0.5
 
-    # ノイズ（“わからなさ”）
     process_noise_km: float = 3.0
     meas_noise_km: float = 6.0
     init_est_noise_km: float = 10.0
 
-    # でんき（太陽に対する傾き制約）
     sun_tilt_limit_deg: float = 45.0
 
-    # 通信（アンテナ角）制約（カンタン版）
-    # 0〜60° または 120〜180°ならOK（60〜120°はダメ）
     comm_ok_low_deg: float = 60.0
     comm_ok_high_deg: float = 120.0
 
-    # “どうしても通信できない期間”の演出（カンタン）
     blackout_start_day: float = 100.0
     blackout_end_day: float = 130.0
 
@@ -63,130 +51,176 @@ CFG = GameConfig()
 
 
 # -----------------------------
-# 軌道（カンタン模型）
+# ベクトル便利関数
 # -----------------------------
-# 単位は AU（天文単位）っぽいスケール。図のための模型です。
+def norm(v: np.ndarray) -> float:
+    return float(np.linalg.norm(v))
 
-EARTH_AU = 1.0
-VENUS_AU = 0.723
-EARTH_PERIOD_D = 365.25
-VENUS_PERIOD_D = 224.7
+def unit(v: np.ndarray) -> np.ndarray:
+    n = norm(v)
+    if n < 1e-12:
+        return np.array([0.0, 0.0, 1.0], dtype=float)
+    return v / n
+
+def angle_deg(u: np.ndarray, v: np.ndarray) -> float:
+    u = unit(u)
+    v = unit(v)
+    c = float(np.clip(np.dot(u, v), -1.0, 1.0))
+    return float(np.degrees(np.arccos(c)))
 
 def smoothstep(x: float) -> float:
     x = max(0.0, min(1.0, x))
     return x * x * (3.0 - 2.0 * x)
 
-def planet_pos(day: float, a_au: float, period_day: float, phase: float = 0.0) -> np.ndarray:
-    theta = 2.0 * math.pi * (day / period_day) + phase
-    return np.array([a_au * math.cos(theta), a_au * math.sin(theta)], dtype=float)
 
-def sc_pos(day: float, total_days: float, earth_phase: float = 0.0) -> np.ndarray:
-    """
-    IKAROSの場所（カンタン模型）:
-    - 半径は地球軌道(1AU)→金星軌道(0.723AU)へ、なめらかに近づく
-    - 角度は地球の角度より少し速く回る（それっぽい）
-    """
-    f = smoothstep(day / total_days)
-    r = EARTH_AU - (EARTH_AU - VENUS_AU) * f
+# -----------------------------
+# JSON読み込み
+# -----------------------------
+def load_json(path: Path) -> Optional[object]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-    # 角速度（模型）：地球より少し速く
-    omega = 2.0 * math.pi / 320.0  # rad/day (toy)
-    theta = 2.0 * math.pi * (day / EARTH_PERIOD_D) + earth_phase + omega * day
-    return np.array([r * math.cos(theta), r * math.sin(theta)], dtype=float)
+ORBIT_DATA = load_json(DATA_DIR / "orbit_schedule.json")
+SENS_DATA = load_json(DATA_DIR / "sensitivity_schedule.json")
 
-def angle_deg(u: np.ndarray, v: np.ndarray) -> float:
-    u = u / (np.linalg.norm(u) + 1e-12)
-    v = v / (np.linalg.norm(v) + 1e-12)
-    c = float(np.clip(np.dot(u, v), -1.0, 1.0))
-    return float(np.degrees(np.arccos(c)))
+def orbit_available() -> bool:
+    return isinstance(ORBIT_DATA, list) and len(ORBIT_DATA) >= 2
 
-def geometry_alpha(day: float, total_days: float) -> float:
-    """
-    α = IKAROSから見た「太陽の方向」と「地球の方向」のなす角（0〜180°）
-    これが小さいと、地球は太陽の近くに見えて “やりにくい” ことが多い。
-    """
+def sens_available() -> bool:
+    return isinstance(SENS_DATA, list) and len(SENS_DATA) >= 1
+
+def _get_entry_by_day(day: float) -> Optional[Dict[str, object]]:
+    if not orbit_available():
+        return None
+    best = min(ORBIT_DATA, key=lambda d: abs(float(d.get("day", 0.0)) - day))
+    return best if isinstance(best, dict) else None
+
+def _to_xy(entry: Dict[str, object], key: str) -> Optional[np.ndarray]:
+    v = entry.get(key, None)
+    if not (isinstance(v, list) and len(v) == 2):
+        return None
+    return np.array([float(v[0]), float(v[1])], dtype=float)
+
+
+# -----------------------------
+# 2D軌道（データ or トイ）
+# -----------------------------
+def get_positions_2d(day: float, total_days: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if orbit_available():
+        e = _get_entry_by_day(day)
+        if e is not None:
+            sun = _to_xy(e, "sun")
+            earth = _to_xy(e, "earth")
+            venus = _to_xy(e, "venus")
+            ikaros = _to_xy(e, "ikaros")
+            if sun is not None and earth is not None and venus is not None and ikaros is not None:
+                return sun, earth, venus, ikaros
+
+    # ---- fallback toy ----
+    EARTH_AU = 1.0
+    VENUS_AU = 0.723
+    EARTH_PERIOD_D = 365.25
+    VENUS_PERIOD_D = 224.7
+
+    def planet_pos(day_: float, a_au: float, period_day: float, phase: float = 0.0) -> np.ndarray:
+        th = 2.0 * math.pi * (day_ / period_day) + phase
+        return np.array([a_au * math.cos(th), a_au * math.sin(th)], dtype=float)
+
+    def sc_pos(day_: float) -> np.ndarray:
+        f = smoothstep(day_ / total_days)
+        r = EARTH_AU - (EARTH_AU - VENUS_AU) * f
+        omega = 2.0 * math.pi / 320.0
+        th = 2.0 * math.pi * (day_ / EARTH_PERIOD_D) + omega * day_
+        return np.array([r * math.cos(th), r * math.sin(th)], dtype=float)
+
     sun = np.array([0.0, 0.0], dtype=float)
     earth = planet_pos(day, EARTH_AU, EARTH_PERIOD_D, phase=0.0)
-    sc = sc_pos(day, total_days, earth_phase=0.0)
+    venus = planet_pos(day, VENUS_AU, VENUS_PERIOD_D, phase=0.6)
+    ikaros = sc_pos(day)
+    return sun, earth, venus, ikaros
 
-    v_sun = sun - sc
-    v_earth = earth - sc
-    return angle_deg(v_sun, v_earth)
 
+# -----------------------------
+# 感度行列 C_k（データ or トイ）
+# -----------------------------
+def get_sensitivity(turn: int) -> np.ndarray:
+    if sens_available():
+        for d in SENS_DATA:
+            if isinstance(d, dict) and int(d.get("turn", -1)) == int(turn):
+                C = d.get("C", None)
+                if isinstance(C, list) and len(C) == 2:
+                    try:
+                        M = np.array(C, dtype=float)
+                        if M.shape == (2, 2):
+                            return M
+                    except Exception:
+                        pass
+    gain = 0.6 + 0.06 * turn
+    return gain * np.array([[1.0, 0.3], [-0.2, 0.9]], dtype=float)
+
+
+# -----------------------------
+# 通信 / でんき（幾何：データ対応）
+# -----------------------------
 def in_blackout(day: float) -> bool:
     return CFG.blackout_start_day <= day <= CFG.blackout_end_day
 
+def beta_to_sun_tilt_deg(bi: float, bo: float) -> float:
+    return float(math.sqrt(bi * bi + bo * bo))
 
-# -----------------------------
-# β → でんき / 通信（カンタン幾何）
-# -----------------------------
-
-def beta_to_sun_tilt_deg(beta_in_deg: float, beta_out_deg: float) -> float:
-    """太陽からどれだけ傾けたか（大きさ）"""
-    return float(math.sqrt(beta_in_deg**2 + beta_out_deg**2))
-
-def power_percent(sun_tilt_deg: float) -> float:
-    """
-    発電量（模型）:
-    - 太陽に正面(0°)で 100%
-    - 傾くほど cos で減る
-    """
-    rad = math.radians(sun_tilt_deg)
-    return float(max(0.0, math.cos(rad)) * 100.0)
-
-def earth_aspect_deg(alpha_deg: float, beta_in_deg: float, beta_out_deg: float) -> float:
-    """
-    アンテナ角（模型）:
-    - IKAROSの “むいている向き” を β_in/β_out で決める
-    - 地球がいる向きは、ローカル座標で [sinα, 0, cosα]
-    - IKAROSの向きは、[sinβin, sinβout, cos(tilt)] を正規化したもの
-    - 2つのなす角が “地球に向けられているか” の目安
-    """
-    tilt = beta_to_sun_tilt_deg(beta_in_deg, beta_out_deg)
-
-    n = np.array([math.sin(math.radians(beta_in_deg)),
-                  math.sin(math.radians(beta_out_deg)),
-                  math.cos(math.radians(tilt))], dtype=float)
-    n = n / (np.linalg.norm(n) + 1e-12)
-
-    e = np.array([math.sin(math.radians(alpha_deg)), 0.0, math.cos(math.radians(alpha_deg))], dtype=float)
-    e = e / (np.linalg.norm(e) + 1e-12)
-
-    c = float(np.clip(np.dot(n, e), -1.0, 1.0))
-    return float(np.degrees(np.arccos(c)))
+def power_percent(tilt_deg: float) -> float:
+    return float(max(0.0, math.cos(math.radians(tilt_deg))) * 100.0)
 
 def comm_ok(earth_aspect: float) -> bool:
     return (earth_aspect <= CFG.comm_ok_low_deg) or (earth_aspect >= CFG.comm_ok_high_deg)
 
+def make_local_frame(sc3: np.ndarray, sun3: np.ndarray, earth3: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    z = unit(sun3 - sc3)
+    e = unit(earth3 - sc3)
+    x_raw = e - np.dot(e, z) * z
+    if norm(x_raw) < 1e-6:
+        tmp = np.array([1.0, 0.0, 0.0], dtype=float)
+        if abs(np.dot(tmp, z)) > 0.9:
+            tmp = np.array([0.0, 1.0, 0.0], dtype=float)
+        x_raw = tmp - np.dot(tmp, z) * z
+    x = unit(x_raw)
+    y = unit(np.cross(z, x))
+    return x, y, z
+
+def earth_aspect_from_beta(sc2: np.ndarray, sun2: np.ndarray, earth2: np.ndarray, bi: float, bo: float) -> float:
+    sc3 = np.array([sc2[0], sc2[1], 0.0], dtype=float)
+    sun3 = np.array([sun2[0], sun2[1], 0.0], dtype=float)
+    earth3 = np.array([earth2[0], earth2[1], 0.0], dtype=float)
+
+    x, y, z = make_local_frame(sc3, sun3, earth3)
+
+    tilt = beta_to_sun_tilt_deg(bi, bo)
+    n_local = unit(np.array([math.sin(math.radians(bi)),
+                             math.sin(math.radians(bo)),
+                             math.cos(math.radians(tilt))], dtype=float))
+
+    e_dir = unit(earth3 - sc3)
+    e_local = unit(np.array([np.dot(e_dir, x), np.dot(e_dir, y), np.dot(e_dir, z)], dtype=float))
+
+    return angle_deg(n_local, e_local)
+
+def alpha_deg(sc2: np.ndarray, sun2: np.ndarray, earth2: np.ndarray) -> float:
+    v_sun = np.array([sun2[0]-sc2[0], sun2[1]-sc2[1], 0.0], dtype=float)
+    v_earth = np.array([earth2[0]-sc2[0], earth2[1]-sc2[1], 0.0], dtype=float)
+    return angle_deg(v_sun, v_earth)
+
 
 # -----------------------------
-# B-plane のダイナミクス（カンタン）
+# 予測楕円（モンテカルロ）
 # -----------------------------
-
-def base_sensitivity(turn: int) -> np.ndarray:
-    """
-    C_k（模型）:
-    - 後半ほど “効きやすい”
-    """
-    gain = 0.6 + 0.06 * turn
-    return gain * np.array([[1.0, 0.3],
-                            [-0.2, 0.9]], dtype=float)
-
-def predict_next_ellipse(x_hat: np.ndarray, turn: int, u: np.ndarray,
-                         k_hat: float, process_noise_km: float,
-                         n_samples: int = 500) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    次の位置の “よそうのふくらみ（楕円）” をモンテカルロで作る。
-    返り値: (平均, 共分散)
-    """
-    C = base_sensitivity(turn)  # (2,2)
-    rng = np.random.default_rng(12345 + turn)
-
-    # “セイルの効き”の不確かさ（模型）
+def predict_next_ellipse(x_hat: np.ndarray, C: np.ndarray, u: np.ndarray,
+                         k_hat: float, process_noise_km: float, n_samples: int) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(12345)
     sigma_k = 0.15
-    k = rng.normal(k_hat, sigma_k, size=n_samples)
-    k = np.clip(k, 0.2, 2.0)
-
+    k = np.clip(rng.normal(k_hat, sigma_k, size=n_samples), 0.2, 2.0)
     w = rng.normal(0.0, process_noise_km, size=(n_samples, 2))
     du = (k[:, None] * (C @ u)[None, :])
     samples = x_hat[None, :] + du + w
@@ -194,27 +228,22 @@ def predict_next_ellipse(x_hat: np.ndarray, turn: int, u: np.ndarray,
     cov = np.cov(samples.T)
     return mu, cov
 
-def ellipse_points(mu: np.ndarray, cov: np.ndarray, nsig: float = 1.0, n: int = 180) -> np.ndarray:
-    """
-    共分散から楕円の点列を作る（2D）。
-    """
+def ellipse_points(mu: np.ndarray, cov: np.ndarray, nsig: float, n: int = 180) -> np.ndarray:
     vals, vecs = np.linalg.eigh(cov)
     vals = np.maximum(vals, 1e-9)
     order = np.argsort(vals)[::-1]
     vals = vals[order]
     vecs = vecs[:, order]
-
     t = np.linspace(0, 2*np.pi, n)
-    circle = np.vstack([np.cos(t), np.sin(t)])  # (2,n)
+    circle = np.vstack([np.cos(t), np.sin(t)])
     axes = nsig * np.sqrt(vals)[:, None] * circle
     pts = (vecs @ axes).T + mu[None, :]
     return pts
 
 
 # -----------------------------
-# セッション状態
+# セッション
 # -----------------------------
-
 def init_state(seed: int = 2) -> None:
     rng = np.random.default_rng(seed)
     st.session_state.turn = 0
@@ -226,7 +255,6 @@ def init_state(seed: int = 2) -> None:
 
     st.session_state.k_true = float(rng.uniform(0.75, 1.25))
     st.session_state.k_hat = 1.0
-
     st.session_state.log: List[Dict[str, object]] = []
 
 
@@ -237,66 +265,61 @@ if "turn" not in st.session_state:
 # -----------------------------
 # UI
 # -----------------------------
-
 st.set_page_config(page_title="IKAROS-GO", layout="wide")
-st.title("IKAROS-GO（試作）— IKAROSみたいに “ねらって” うごかすゲーム")
+st.title("IKAROS-GO（試作 v3）— “本物のデータ” に差し替えられる版")
 
 total_days = CFG.n_turns * CFG.turn_days
 progress = min(1.0, st.session_state.turn / CFG.n_turns)
 
+sun2, earth2, venus2, sc2 = get_positions_2d(st.session_state.day, total_days)
+alpha_now = alpha_deg(sc2, sun2, earth2)
+
 with st.sidebar:
     st.header("そうさ")
-    st.caption("β（ベータ）を動かすと、IKAROSのむきが変わります。")
+    st.caption("β（ベータ）を動かして、むきを変えよう。")
 
-    seed = st.number_input("ランダムのタネ（seed）", min_value=0, max_value=9999,
-                           value=int(st.session_state.rng_seed), step=1)
+    st.caption("データ読み込み状況")
+    st.write(f"- orbit_schedule.json: {'ある ✅' if orbit_available() else 'ない（模型）'}")
+    st.write(f"- sensitivity_schedule.json: {'ある ✅' if sens_available() else 'ない（模型）'}")
+
+    seed = st.number_input("ランダムのタネ（seed）", 0, 9999, int(st.session_state.rng_seed), 1)
     if st.button("さいしょからやり直す"):
         init_state(int(seed))
         st.rerun()
 
     st.markdown("---")
-
-    beta_in = st.slider("β_in（左右のかたむき） [deg]",
-                        -CFG.beta_max_deg, CFG.beta_max_deg, 0.0, CFG.beta_step_deg)
-    beta_out = st.slider("β_out（上下のかたむき） [deg]",
-                         -CFG.beta_max_deg, CFG.beta_max_deg, 0.0, CFG.beta_step_deg)
+    beta_in = st.slider("β_in（左右）[deg]", -CFG.beta_max_deg, CFG.beta_max_deg, 0.0, CFG.beta_step_deg)
+    beta_out = st.slider("β_out（上下）[deg]", -CFG.beta_max_deg, CFG.beta_max_deg, 0.0, CFG.beta_step_deg)
 
     st.markdown("---")
-    n_samples = st.slider("よそうの点の数（多いほどなめらか）", 200, 1200, 500, 100)
+    n_samples = st.slider("よそうの点の数", 200, 2000, 800, 100)
 
-    step = st.button("つぎの2週間へ（すすめる）", type="primary",
-                     disabled=(st.session_state.turn >= CFG.n_turns))
+    step = st.button("つぎの2週間へ（すすめる）", type="primary", disabled=(st.session_state.turn >= CFG.n_turns))
 
-# 現在の幾何（α）
-alpha = geometry_alpha(st.session_state.day, total_days)
 tilt = beta_to_sun_tilt_deg(beta_in, beta_out)
 pwr = power_percent(tilt)
-ea = earth_aspect_deg(alpha, beta_in, beta_out)
+earth_aspect = earth_aspect_from_beta(sc2, sun2, earth2, beta_in, beta_out)
 
-# 通信できた？（このβで）
-comm_success = (not in_blackout(st.session_state.day)) and (tilt <= CFG.sun_tilt_limit_deg) and comm_ok(ea)
+comm_success = (not in_blackout(st.session_state.day)) and (tilt <= CFG.sun_tilt_limit_deg) and comm_ok(earth_aspect)
 
-# 進みぐあい
 st.caption("進みぐあい（0% → 100%）")
 st.progress(progress)
 
-# ステータス
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("いまのターン", f"{st.session_state.turn + 1}/{CFG.n_turns}")
-c2.metric("地球と太陽の角度 α", f"{alpha:.1f}°", help="IKAROSから見た地球と太陽のはなれぐあい")
-c3.metric("発電（模型）", f"{pwr:.0f}%", help="太陽に正面ほど大きい")
-c4.metric("通信", "できた ✅" if comm_success else "できない ❌",
-          help="アンテナ角と発電の条件をみたすと通信できる")
+c2.metric("地球と太陽の角度 α", f"{alpha_now:.1f}°")
+c3.metric("でんき（模型）", f"{pwr:.0f}%")
+c4.metric("通信", "できた ✅" if comm_success else "できない ❌")
 
 if in_blackout(st.session_state.day):
-    st.warning("いまはブラックアウト中：なにをしても通信できません（演出）")
+    st.warning("ブラックアウト中：なにをしても通信できません（演出）")
 
-# すすめる（ターン更新）
 if step:
     rng = np.random.default_rng(int(st.session_state.rng_seed) + 1000 + int(st.session_state.turn))
     u = np.array([beta_in, beta_out], dtype=float)
 
-    C_true = float(st.session_state.k_true) * base_sensitivity(st.session_state.turn)
+    C = get_sensitivity(int(st.session_state.turn))
+    C_true = float(st.session_state.k_true) * C
     w = rng.normal(0.0, CFG.process_noise_km, size=2)
     st.session_state.x_true = st.session_state.x_true + C_true @ u + w
 
@@ -312,49 +335,35 @@ if step:
         "beta_out": float(beta_out),
         "BT_hat": float(st.session_state.x_hat[0]),
         "BR_hat": float(st.session_state.x_hat[1]),
-        "alpha": float(alpha),
-        "tilt": float(tilt),
+        "alpha_deg": float(alpha_now),
+        "tilt_deg": float(tilt),
         "power_%": float(pwr),
-        "earth_aspect": float(ea),
+        "earth_aspect_deg": float(earth_aspect),
         "comm": bool(comm_success),
-        "blackout": bool(in_blackout(st.session_state.day)),
         "k_hat": float(st.session_state.k_hat),
     })
 
     st.session_state.turn += 1
     st.session_state.day += float(CFG.turn_days)
-
     if st.session_state.turn >= CFG.n_turns:
-        st.success("ミッションおわり！（試作）")
-
+        st.success("ミッションおわり！")
     st.rerun()
 
 
-# -----------------------------
-# 表示タブ
-# -----------------------------
-
 tab1, tab2, tab3 = st.tabs(["B-plane（ねらい）", "太陽系の図（いまどこ？）", "βマップ（通信とでんき）"])
 
-# --- Tab 1: B-plane ---
 with tab1:
-    st.subheader("B-plane（ねらいの平面）")
-    st.caption("点＝いまのよそう場所。楕円＝つぎに行きそうな “ばらつき（よそう）”")
+    st.subheader("B-plane（ねらい）")
+    st.caption("楕円＝つぎに行きそうな “ばらつき” です。")
 
     x_hat = np.array(st.session_state.x_hat, dtype=float)
     u = np.array([beta_in, beta_out], dtype=float)
 
     if st.session_state.turn < CFG.n_turns:
-        mu, cov = predict_next_ellipse(
-            x_hat=x_hat,
-            turn=int(st.session_state.turn),
-            u=u,
-            k_hat=float(st.session_state.k_hat),
-            process_noise_km=CFG.process_noise_km,
-            n_samples=int(n_samples),
-        )
-        e1 = ellipse_points(mu, cov, nsig=1.0)
-        e2 = ellipse_points(mu, cov, nsig=2.0)
+        C = get_sensitivity(int(st.session_state.turn))
+        mu, cov = predict_next_ellipse(x_hat, C, u, float(st.session_state.k_hat), CFG.process_noise_km, int(n_samples))
+        e1 = ellipse_points(mu, cov, 1.0)
+        e2 = ellipse_points(mu, cov, 2.0)
     else:
         mu, e1, e2 = x_hat, None, None
 
@@ -364,122 +373,70 @@ with tab1:
     fig = go.Figure()
 
     th = np.linspace(0, 2*np.pi, 240)
-    fig.add_trace(go.Scatter(
-        x=target[0] + tol*np.cos(th),
-        y=target[1] + tol*np.sin(th),
-        mode="lines",
-        name="ゴール（ゆるい範囲）",
-    ))
+    fig.add_trace(go.Scatter(x=target[0] + tol*np.cos(th), y=target[1] + tol*np.sin(th),
+                             mode="lines", name="ゴール（ゆるい範囲）"))
 
     if st.session_state.log:
         xs = [d["BT_hat"] for d in st.session_state.log]
         ys = [d["BR_hat"] for d in st.session_state.log]
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="これまで"))
 
-    fig.add_trace(go.Scatter(
-        x=[x_hat[0]], y=[x_hat[1]],
-        mode="markers",
-        name="いま（よそう）"
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=[float(mu[0])], y=[float(mu[1])],
-        mode="markers",
-        name="つぎ（まんなか）"
-    ))
+    fig.add_trace(go.Scatter(x=[x_hat[0]], y=[x_hat[1]], mode="markers", name="いま（よそう）"))
+    fig.add_trace(go.Scatter(x=[float(mu[0])], y=[float(mu[1])], mode="markers", name="つぎ（まんなか）"))
 
     if e2 is not None:
-        fig.add_trace(go.Scatter(
-            x=e2[:, 0], y=e2[:, 1],
-            mode="lines",
-            name="つぎのよそう（2σ）",
-            fill="toself",
-            opacity=0.15,
-        ))
+        fig.add_trace(go.Scatter(x=e2[:, 0], y=e2[:, 1], mode="lines", name="つぎ（2σ）", fill="toself", opacity=0.15))
     if e1 is not None:
-        fig.add_trace(go.Scatter(
-            x=e1[:, 0], y=e1[:, 1],
-            mode="lines",
-            name="つぎのよそう（1σ）",
-            fill="toself",
-            opacity=0.25,
-        ))
+        fig.add_trace(go.Scatter(x=e1[:, 0], y=e1[:, 1], mode="lines", name="つぎ（1σ）", fill="toself", opacity=0.25))
 
-    fig.add_trace(go.Scatter(
-        x=[x_hat[0], float(mu[0])],
-        y=[x_hat[1], float(mu[1])],
-        mode="lines",
-        name="うごく向き（平均）",
-    ))
+    fig.add_trace(go.Scatter(x=[x_hat[0], float(mu[0])], y=[x_hat[1], float(mu[1])],
+                             mode="lines", name="うごく向き（平均）"))
 
-    fig.update_layout(
-        xaxis_title="B_T (km)",
-        yaxis_title="B_R (km)",
-        height=600,
-        margin=dict(l=10, r=10, t=10, b=10),
-        showlegend=True,
-    )
+    fig.update_layout(xaxis_title="B_T (km)", yaxis_title="B_R (km)", height=600,
+                      margin=dict(l=10, r=10, t=10, b=10), showlegend=True)
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
-    st.subheader("ログ（これまで）")
+    st.subheader("ログ")
     st.dataframe(st.session_state.log, use_container_width=True)
 
-
-# --- Tab 2: Orbit 2D diagram ---
 with tab2:
     st.subheader("太陽・地球・金星・IKAROS（2D図）")
-    st.caption("これは “それっぽい模型” の図です。ほんとうの軌道とは少しちがいます。")
+    st.caption("データがあると、そのデータで動きます。")
 
     day = float(st.session_state.day)
-    sun = np.array([0.0, 0.0], dtype=float)
-    earth = planet_pos(day, EARTH_AU, EARTH_PERIOD_D, phase=0.0)
-    venus = planet_pos(day, VENUS_AU, VENUS_PERIOD_D, phase=0.6)  # 見やすさで位相をずらす
-    sc = sc_pos(day, total_days, earth_phase=0.0)
+    sun, earth, venus, sc = get_positions_2d(day, total_days)
 
-    days = np.linspace(0, total_days, 240)
-    sc_path = np.vstack([sc_pos(float(d), total_days) for d in days])
-
-    th = np.linspace(0, 2*np.pi, 360)
-    earth_orbit = np.vstack([EARTH_AU*np.cos(th), EARTH_AU*np.sin(th)]).T
-    venus_orbit = np.vstack([VENUS_AU*np.cos(th), VENUS_AU*np.sin(th)]).T
+    days = np.linspace(0, total_days, 260)
+    sc_path, earth_path, venus_path = [], [], []
+    for d in days:
+        s, e, v, k = get_positions_2d(float(d), total_days)
+        sc_path.append(k); earth_path.append(e); venus_path.append(v)
+    sc_path = np.vstack(sc_path); earth_path = np.vstack(earth_path); venus_path = np.vstack(venus_path)
 
     fig2 = go.Figure()
-
-    fig2.add_trace(go.Scatter(x=earth_orbit[:,0], y=earth_orbit[:,1], mode="lines", name="地球の道（円）"))
-    fig2.add_trace(go.Scatter(x=venus_orbit[:,0], y=venus_orbit[:,1], mode="lines", name="金星の道（円）"))
-    fig2.add_trace(go.Scatter(x=sc_path[:,0], y=sc_path[:,1], mode="lines", name="IKAROSの道（模型）"))
+    fig2.add_trace(go.Scatter(x=earth_path[:,0], y=earth_path[:,1], mode="lines", name="地球の道"))
+    fig2.add_trace(go.Scatter(x=venus_path[:,0], y=venus_path[:,1], mode="lines", name="金星の道"))
+    fig2.add_trace(go.Scatter(x=sc_path[:,0], y=sc_path[:,1], mode="lines", name="IKAROSの道"))
 
     fig2.add_trace(go.Scatter(x=[sun[0]], y=[sun[1]], mode="markers", name="太陽"))
     fig2.add_trace(go.Scatter(x=[earth[0]], y=[earth[1]], mode="markers", name="地球"))
     fig2.add_trace(go.Scatter(x=[venus[0]], y=[venus[1]], mode="markers", name="金星"))
     fig2.add_trace(go.Scatter(x=[sc[0]], y=[sc[1]], mode="markers", name="IKAROS（いま）"))
 
-    fig2.update_layout(
-        xaxis_title="x (AU)",
-        yaxis_title="y (AU)",
-        height=620,
-        margin=dict(l=10, r=10, t=10, b=10),
-        showlegend=True,
-    )
+    fig2.update_layout(xaxis_title="x", yaxis_title="y", height=640,
+                       margin=dict(l=10, r=10, t=10, b=10), showlegend=True)
     fig2.update_yaxes(scaleanchor="x", scaleratio=1)
     st.plotly_chart(fig2, use_container_width=True)
 
-    st.markdown("### いまの説明")
-    st.write(
-        f"- きょうは **{day:.0f}日目**（模型）\n"
-        f"- 進みぐあいは **{progress*100:.0f}%**\n"
-        f"- 地球と太陽の角度 α は **{alpha:.1f}°**（小さいとむずかしいことが多い）"
-    )
+    st.write(f"- きょうは **{day:.0f}日目**  /  進みぐあい **{progress*100:.0f}%**  /  α **{alpha_now:.1f}°**")
 
-
-# --- Tab 3: beta plane map ---
 with tab3:
     st.subheader("βマップ（通信とでんき）")
-    st.caption("β_in と β_out をどこにすると “通信できる / でんきが多い” かを見える化します。")
+    st.caption("背景＝でんき、太い線＝通信できる場所です。")
 
-    grid_step = 1.0  # deg（軽さ優先）
+    grid_step = 1.0
     xs = np.arange(-CFG.beta_max_deg, CFG.beta_max_deg + 1e-9, grid_step)
     ys = np.arange(-CFG.beta_max_deg, CFG.beta_max_deg + 1e-9, grid_step)
 
@@ -497,64 +454,29 @@ with tab3:
             for i, bi in enumerate(xs):
                 tilt_ = beta_to_sun_tilt_deg(float(bi), float(bo))
                 P[j, i] = power_percent(tilt_)
-                ea_ = earth_aspect_deg(alpha, float(bi), float(bo))
+                ea_ = earth_aspect_from_beta(sc2, sun2, earth2, float(bi), float(bo))
                 ok = (tilt_ <= CFG.sun_tilt_limit_deg) and comm_ok(ea_)
                 COMM[j, i] = 1.0 if ok else 0.0
 
     fig3 = go.Figure()
-
-    fig3.add_trace(go.Heatmap(
-        x=xs, y=ys, z=P,
-        colorbar=dict(title="でんき(%)"),
-        name="でんき"
-    ))
-
-    fig3.add_trace(go.Contour(
-        x=xs, y=ys, z=COMM,
-        showscale=False,
-        contours=dict(start=0.5, end=0.5, size=1),
-        name="通信OKの線",
-        line=dict(width=3),
-        opacity=0.9
-    ))
+    fig3.add_trace(go.Heatmap(x=xs, y=ys, z=P, colorbar=dict(title="でんき(%)"), name="でんき"))
+    fig3.add_trace(go.Contour(x=xs, y=ys, z=COMM, showscale=False,
+                              contours=dict(start=0.5, end=0.5, size=1),
+                              name="通信OKの線", line=dict(width=3), opacity=0.9))
 
     th = np.linspace(0, 2*np.pi, 240)
     r = CFG.sun_tilt_limit_deg
-    fig3.add_trace(go.Scatter(
-        x=r*np.cos(th),
-        y=r*np.sin(th),
-        mode="lines",
-        name=f"でんき制限 {CFG.sun_tilt_limit_deg:.0f}°"
-    ))
+    fig3.add_trace(go.Scatter(x=r*np.cos(th), y=r*np.sin(th), mode="lines", name=f"でんき制限 {r:.0f}°"))
+    fig3.add_trace(go.Scatter(x=[beta_in], y=[beta_out], mode="markers", name="いまのβ"))
 
-    fig3.add_trace(go.Scatter(
-        x=[beta_in], y=[beta_out],
-        mode="markers",
-        name="いまのβ"
-    ))
-
-    fig3.update_layout(
-        xaxis_title="β_in (deg)",
-        yaxis_title="β_out (deg)",
-        height=650,
-        margin=dict(l=10, r=10, t=10, b=10),
-        showlegend=True,
-    )
+    fig3.update_layout(xaxis_title="β_in (deg)", yaxis_title="β_out (deg)", height=650,
+                       margin=dict(l=10, r=10, t=10, b=10), showlegend=True)
     fig3.update_yaxes(scaleanchor="x", scaleratio=1)
     st.plotly_chart(fig3, use_container_width=True)
 
-    st.markdown("### いまのβの結果（カンタン説明）")
     st.write(
-        f"- 太陽からのかたむき: **{tilt:.1f}°**（小さいほどでんき↑）\n"
-        f"- でんき（模型）: **{pwr:.0f}%**\n"
-        f"- 地球に向けた角度（アンテナ角）: **{ea:.1f}°**\n"
+        f"- 太陽からのかたむき: **{tilt:.1f}°**\n"
+        f"- でんき: **{pwr:.0f}%**\n"
+        f"- 地球に向けた角度（アンテナ角）: **{earth_aspect:.1f}°**\n"
         f"- 通信: **{'できる' if comm_success else 'できない'}**"
-        + ("（ブラックアウト中）" if in_blackout(st.session_state.day) else "")
-    )
-
-    st.info(
-        "ポイント：\n"
-        "- 背景は “でんき” です（100%が強い）。\n"
-        "- 太い線の内側/外側の一部が “通信できる” ところです。\n"
-        "- まるい線の外に出ると、でんきの制限をこえやすいです。"
     )
