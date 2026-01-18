@@ -1,2 +1,2 @@
-orbit_schedule.json と sensitivity_schedule.json を置くと、それを読みます。
-まずは *.example.json をコピーして使ってください。
+ここに orbit_schedule.json / sensitivity_schedule.json / mission_config.json が入ります。
+生成：python tools/generate_data.py --out data --profile ikaros2010 --step 2

@@ -1,38 +1,27 @@
-# IKAROS-GO（試作 v3）
+\
+# IKAROS-GO（試作 v4）
 
-この版は **あなたの計算したデータをJSONで差し替え** できるようにしてあります。
+Streamlitで動く、IKAROSっぽい「うごかして学ぶ」ゲームです。
 
-## すぐ動かす
-
+## すぐ動かす（模型モード）
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## データを入れる（ここが本題）
-
-### 1) 2D軌道：`data/orbit_schedule.json`
-このファイルがあると、2D図と幾何（太陽方向/地球方向）がそのデータになります。
-
-例：
-
-```json
-[
-  {"day":0,  "sun":[0,0], "earth":[1,0], "venus":[0.723,0], "ikaros":[0.95,0.10]},
-  {"day":14, "sun":[0,0], "earth":[0.97,0.24], "venus":[0.68,0.25], "ikaros":[0.90,0.20]}
-]
+## “IKAROSっぽい”データを自動生成（おすすめ）
+```bash
+python tools/generate_data.py --out data --profile ikaros2010 --step 2
+streamlit run app.py
 ```
 
-### 2) 感度行列：`data/sensitivity_schedule.json`
-このファイルがあると、β→B-plane の効きがそのデータになります。
+できるもの：
+- `data/orbit_schedule.json`（太陽/地球/金星/IKAROS の 3D 位置）
+- `data/sensitivity_schedule.json`（β→B-plane の効き 2×2）
+- `data/mission_config.json`（ターン数・初期B-planeなど）
 
-例：
-
-```json
-[
-  {"turn":0, "C":[[1.0,0.3],[-0.2,0.9]]},
-  {"turn":1, "C":[[1.1,0.2],[-0.1,1.0]]}
-]
-```
-
-まずは `data/*.example.json` をコピーして作るのが早いです。
+## タブ
+- B-plane（ねらい）: 予測楕円つき
+- 太陽系の図（2D）: いまどこ？
+- βマップ: 通信できる場所 / でんき
+- 3次元可視化: 太陽方向・地球方向・帆面法線（β）ベクトル表示
