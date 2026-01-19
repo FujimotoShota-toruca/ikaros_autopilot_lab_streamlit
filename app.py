@@ -372,8 +372,15 @@ with tab1:
     tol = float(CFG.tolerance_km)
 
     fig = go.Figure()
+
+    # 金星の位置（この簡易モデルではB-planeの原点が金星だと思ってOK）
+    fig.add_trace(go.Scatter(x=[0.0], y=[0.0], mode="markers", name="金星（基準点）"))
+
+    # 目標点
+    fig.add_trace(go.Scatter(x=[float(target[0])], y=[float(target[1])], mode="markers", name="目標"))
+
     th = np.linspace(0,2*np.pi,240)
-    fig.add_trace(go.Scatter(x=target[0]+tol*np.cos(th), y=target[1]+tol*np.sin(th), mode="lines", name="ゴール（ゆるい範囲）"))
+    fig.add_trace(go.Scatter(x=target[0]+tol*np.cos(th), y=target[1]+tol*np.sin(th), mode="lines", name="許容誤差（半径）"))
 
     if st.session_state.log:
         xs = [d["BT_hat"] for d in st.session_state.log]
@@ -451,43 +458,97 @@ with tab3:
     st.write(f"- 太陽からのかたむき: **{tilt:.1f}°**\n- でんき: **{pwr:.0f}%**\n- 地球に向けた角度: **{ea:.1f}°**\n- 通信: **{'できる' if comm_success else 'できない'}**")
 
 with tab4:
-    st.subheader("3次元可視化（ベクトルつき）")
-    days = np.linspace(0, total_days, 260)
-    sc_p, e_p, v_p = [], [], []
-    for d in days:
-        s,e,v,k = get_positions_3d(float(d), total_days)
-        sc_p.append(k); e_p.append(e); v_p.append(v)
-    sc_p = np.vstack(sc_p); e_p = np.vstack(e_p); v_p = np.vstack(v_p)
+    st.subheader("3次元可視化（通信コーン + 太陽/地球ベクトル + 帆の平面）")
+    st.caption("軌道は描きません。IKAROSのまわりだけを、立体で見ます。")
 
-    sun_dir = unit(sun - sc)
-    earth_dir = unit(earth - sc)
-    sail_dir = sail_normal(sc, sun, earth, beta_in, beta_out)
-    L = float(vec_scale)
+    # いまのベクトル（IKAROSから見た向き）
+    sun_dir = unit(sun - sc)      # IKAROS→太陽
+    earth_dir = unit(earth - sc)  # IKAROS→地球
+    sail_n = sail_normal(sc, sun, earth, beta_in, beta_out)  # 帆面法線（β）
+
+    # 表示スケール（見やすさ）
+    L = float(vec_scale)          # ベクトル長
+    Lc = float(vec_scale) * 1.6   # コーンの長さ
+    plane_size = float(vec_scale) * 0.9
+
+    # ローカル座標：IKAROSを原点にする
+    O = np.array([0.0, 0.0, 0.0], dtype=float)
 
     def vec_trace(name: str, v: np.ndarray):
-        p0 = sc
-        p1 = sc + L*v
-        return go.Scatter3d(x=[p0[0],p1[0]], y=[p0[1],p1[1]], z=[p0[2],p1[2]], mode="lines+markers", name=name)
+        p1 = O + L * v
+        return go.Scatter3d(
+            x=[O[0], p1[0]], y=[O[1], p1[1]], z=[O[2], p1[2]],
+            mode="lines+markers", name=name
+        )
+
+    def orthonormal_basis(axis: np.ndarray):
+        axis = unit(axis)
+        tmp = np.array([1.0, 0.0, 0.0], dtype=float)
+        if abs(np.dot(tmp, axis)) > 0.9:
+            tmp = np.array([0.0, 1.0, 0.0], dtype=float)
+        u = tmp - np.dot(tmp, axis) * axis
+        u = unit(u)
+        v = unit(np.cross(axis, u))
+        return u, v
+
+    def cone_surface(axis: np.ndarray, half_angle_deg: float, length: float, n_phi: int = 80, n_r: int = 20):
+        """原点から伸びるコーン面（x,y,z の2D配列）"""
+        axis = unit(axis)
+        u, v = orthonormal_basis(axis)
+        theta = math.radians(half_angle_deg)
+
+        phis = np.linspace(0.0, 2*math.pi, n_phi)
+        rs = np.linspace(0.0, length, n_r)
+
+        X = np.zeros((n_r, n_phi), dtype=float)
+        Y = np.zeros((n_r, n_phi), dtype=float)
+        Z = np.zeros((n_r, n_phi), dtype=float)
+
+        for i, r_ in enumerate(rs):
+            for j, phi in enumerate(phis):
+                dir_ = math.cos(theta) * axis + math.sin(theta) * (math.cos(phi) * u + math.sin(phi) * v)
+                p = r_ * dir_
+                X[i, j], Y[i, j], Z[i, j] = float(p[0]), float(p[1]), float(p[2])
+        return X, Y, Z
+
+    def sail_plane_trace(n_hat: np.ndarray, size: float):
+        """帆の平面（四角形）を線で表示"""
+        n_hat = unit(n_hat)
+        a, b = orthonormal_basis(n_hat)  # a,b は平面内
+        p1 = O + size*(+a + b)
+        p2 = O + size*(+a - b)
+        p3 = O + size*(-a - b)
+        p4 = O + size*(-a + b)
+        xs = [p1[0], p2[0], p3[0], p4[0], p1[0]]
+        ys = [p1[1], p2[1], p3[1], p4[1], p1[1]]
+        zs = [p1[2], p2[2], p3[2], p4[2], p1[2]]
+        return go.Scatter3d(x=xs, y=ys, z=zs, mode="lines", name="帆の平面（イメージ）")
+
+    # 通信可能コーン：地球方向に対して 0〜60° または 120〜180°（= 反対向きから60°以内）
+    # → 地球方向のコーン（半角60°）と、反対向きのコーン（半角60°）を描く
+    X1, Y1, Z1 = cone_surface(earth_dir, CFG.comm_ok_low_deg, Lc)
+    X2, Y2, Z2 = cone_surface(-earth_dir, CFG.comm_ok_low_deg, Lc)
 
     fig4 = go.Figure()
-    fig4.add_trace(go.Scatter3d(x=e_p[:,0], y=e_p[:,1], z=e_p[:,2], mode="lines", name="地球の道"))
-    fig4.add_trace(go.Scatter3d(x=v_p[:,0], y=v_p[:,1], z=v_p[:,2], mode="lines", name="金星の道"))
-    fig4.add_trace(go.Scatter3d(x=sc_p[:,0], y=sc_p[:,1], z=sc_p[:,2], mode="lines", name="IKAROSの道"))
-    fig4.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode="markers", name="太陽"))
-    fig4.add_trace(go.Scatter3d(x=[earth[0]], y=[earth[1]], z=[earth[2]], mode="markers", name="地球"))
-    fig4.add_trace(go.Scatter3d(x=[venus[0]], y=[venus[1]], z=[venus[2]], mode="markers", name="金星"))
-    fig4.add_trace(go.Scatter3d(x=[sc[0]], y=[sc[1]], z=[sc[2]], mode="markers", name="IKAROS（いま）"))
+    fig4.add_trace(vec_trace("太陽方向（IKAROS→太陽）", sun_dir))
+    fig4.add_trace(vec_trace("地球方向（IKAROS→地球）", earth_dir))
+    fig4.add_trace(vec_trace("帆面法線（β）", sail_n))
+    fig4.add_trace(sail_plane_trace(sail_n, plane_size))
 
-    fig4.add_trace(vec_trace("太陽方向（SC→Sun）", sun_dir))
-    fig4.add_trace(vec_trace("地球方向（SC→Earth）", earth_dir))
-    fig4.add_trace(vec_trace("帆面法線（β）", sail_dir))
+    fig4.add_trace(go.Surface(x=X1, y=Y1, z=Z1, name="通信できるコーン（地球向き）", opacity=0.18, showscale=False))
+    fig4.add_trace(go.Surface(x=X2, y=Y2, z=Z2, name="通信できるコーン（反対向き）", opacity=0.18, showscale=False))
 
-    fig4.update_layout(scene=dict(xaxis_title="x",yaxis_title="y",zaxis_title="z", aspectmode="data"),
-                       height=720, margin=dict(l=10,r=10,t=10,b=10), showlegend=True)
+    fig4.update_layout(
+        scene=dict(xaxis_title="x", yaxis_title="y", zaxis_title="z", aspectmode="data"),
+        height=720,
+        margin=dict(l=10, r=10, t=10, b=10),
+        showlegend=True,
+    )
     st.plotly_chart(fig4, use_container_width=True)
 
+    st.markdown("### かんたん説明")
     st.write(
-        "- **太陽方向**：こっちへ向けると、でんきが作りやすい\n"
-        "- **地球方向**：こっちへ向けると、通信しやすい\n"
-        "- **帆面法線**：βで決まる“いまのむき”（操作してるやつ）"
+        "- **地球方向**のコーンの中に、帆の法線が入ると通信しやすい（このゲームのルール）\n"
+        "- **太陽方向**に近いほど、でんき（発電）が増える\n"
+        "- **帆の平面**は「向きのイメージ」です（四角い板だと思ってOK）"
     )
