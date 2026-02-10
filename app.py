@@ -29,7 +29,10 @@ class GameConfig:
 
     process_noise_km: float = 3.0
     meas_noise_km: float = 6.0
-    init_est_noise_km: float = 10.0
+    init_est_noise_km: float = 25.0
+
+    # βが0でもズレる（模型）：見えない“ゆっくりドリフト”
+    drift_per_turn_km: float = 6.0
 
     sun_tilt_limit_deg: float = 45.0
     comm_ok_low_deg: float = 60.0
@@ -162,6 +165,23 @@ def get_positions_3d(day: float, total_days: float) -> Tuple[np.ndarray, np.ndar
     sc = sc_pos(day)
     return sun, earth, venus, sc
 
+
+def get_geom_positions(day: float, total_days: float, eps_day: float = 1.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    幾何計算用の位置。
+    day=0 付近は IKAROS と地球が同じ場所になって、地球方向ベクトルが 0 になりがちです。
+    そのときは、少しだけ未来（day+eps_day）で計算した位置を使います。
+    """
+    sun, earth, venus, sc = get_positions_3d(day, total_days)
+    if norm(earth - sc) < 1e-8:
+        d2 = min(day + eps_day, total_days)
+        sun, earth, venus, sc = get_positions_3d(d2, total_days)
+    return sun, earth, venus, sc
+
+def power_percent_from_vectors(sail_n: np.ndarray, sun_dir: np.ndarray) -> float:
+    """ベクトルから発電量（模型）。太陽方向に向いているほど大きい。"""
+    return float(max(0.0, float(np.dot(unit(sail_n), unit(sun_dir)))) * 100.0)
+
 def get_sensitivity(turn: int) -> np.ndarray:
     if sens_available():
         for d in SENS_DATA:
@@ -259,6 +279,10 @@ def init_state(seed: int=2):
 
     st.session_state.k_true = float(rng.uniform(0.75, 1.25))
     st.session_state.k_hat = 1.0
+
+    # β=0でも少しずつズレる（本当の宇宙っぽさ）
+    st.session_state.drift = rng.normal(0.0, CFG.drift_per_turn_km, size=(CFG.n_turns, 2))
+
     st.session_state.log: List[Dict[str, object]] = []
 
 if "turn" not in st.session_state:
@@ -272,7 +296,9 @@ st.title("IKAROS-GO（試作）— IKAROSみたいに“ねらって”うごか
 
 total_days = CFG.n_turns*CFG.turn_days
 sun, earth, venus, sc = get_positions_3d(st.session_state.day, total_days)
-alpha_now = alpha_deg(sc, sun, earth)
+# 幾何は“安全版”で計算（初期に地球方向が0にならないように）
+sun_g, earth_g, venus_g, sc_g = get_geom_positions(st.session_state.day, total_days)
+alpha_now = alpha_deg(sc_g, sun_g, earth_g)
 
 with st.sidebar:
     st.header("そうさ")
@@ -302,9 +328,20 @@ st.caption("進みぐあい（0% → 100%）")
 st.progress(progress)
 
 tilt = beta_to_tilt(beta_in, beta_out)
-pwr = power_percent(tilt)
-ea = earth_aspect(sc, sun, earth, beta_in, beta_out)
-comm_success = (not in_blackout(st.session_state.day)) and (tilt <= CFG.sun_tilt_limit_deg) and comm_ok(ea)
+# ベクトルから「でんき」と「通信」を計算
+sun_dir = unit(sun_g - sc_g)
+earth_dir = unit(earth_g - sc_g)
+sail_n_now = sail_normal(sc_g, sun_g, earth_g, beta_in, beta_out)
+
+# でんき（太陽方向に近いほど大きい）
+pwr = power_percent_from_vectors(sail_n_now, sun_dir)
+
+# 通信（帆面法線＝アンテナの向き、という模型）
+ea = angle_deg(sail_n_now, earth_dir)
+
+# でんき制限は、太陽方向との角度でチェック
+sun_aspect = angle_deg(sail_n_now, sun_dir)
+comm_success = (not in_blackout(st.session_state.day)) and (sun_aspect <= CFG.sun_tilt_limit_deg) and comm_ok(ea)
 
 c1,c2,c3,c4 = st.columns(4)
 c1.metric("いまのターン", f"{st.session_state.turn+1}/{CFG.n_turns}")
@@ -324,7 +361,8 @@ if step_btn:
     C_true = float(st.session_state.k_true) * C
 
     w = rng.normal(0.0, CFG.process_noise_km, size=2)
-    st.session_state.x_true = st.session_state.x_true + C_true @ u + w
+    drift = np.array(st.session_state.drift[int(st.session_state.turn)], dtype=float)
+    st.session_state.x_true = st.session_state.x_true + drift + C_true @ u + w
 
     if comm_success:
         meas = st.session_state.x_true + rng.normal(0.0, CFG.meas_noise_km, size=2)
@@ -345,6 +383,8 @@ if step_btn:
         "comm": bool(comm_success),
         "blackout": bool(in_blackout(st.session_state.day)),
         "k_hat": float(st.session_state.k_hat),
+        "drift_BT": float(drift[0]),
+        "drift_BR": float(drift[1]),
     })
 
     st.session_state.turn += 1
@@ -360,6 +400,13 @@ tab1, tab2, tab3, tab4 = st.tabs(["B-plane（ねらい）","太陽系の図（2D
 
 with tab1:
     st.subheader("B-plane（ねらいの平面）")
+
+    # スコア（近いほど高い）
+    dist_km = float(np.linalg.norm(x_hat - target))
+    score_radius = 4.0 * float(CFG.tolerance_km)
+    score = int(max(0.0, round(100.0 * (1.0 - dist_km / (score_radius + 1e-12)))))
+    st.metric("スコア", f"{score}点")
+
     x_hat = np.array(st.session_state.x_hat, dtype=float)
     u = np.array([beta_in, beta_out], dtype=float)
     C = get_sensitivity(int(st.session_state.turn)) if st.session_state.turn < CFG.n_turns else np.eye(2)
@@ -381,6 +428,18 @@ with tab1:
 
     th = np.linspace(0,2*np.pi,240)
     fig.add_trace(go.Scatter(x=target[0]+tol*np.cos(th), y=target[1]+tol*np.sin(th), mode="lines", name="許容誤差（半径）"))
+
+    # ダーツみたいに、同心円をいくつか出す（近いほど高得点）
+    ring_r = [tol*0.25, tol*0.5, tol*1.0, tol*2.0, tol*4.0]
+    ring_name = ["100点", "80点", "60点", "30点", "10点"]
+    for rr, nn in zip(ring_r, ring_name):
+        fig.add_trace(go.Scatter(
+            x=target[0] + rr*np.cos(th),
+            y=target[1] + rr*np.sin(th),
+            mode="lines",
+            name=f"点数目安：{nn}"
+        ))
+
 
     if st.session_state.log:
         xs = [d["BT_hat"] for d in st.session_state.log]
@@ -430,19 +489,41 @@ with tab3:
     ys = np.arange(-CFG.beta_max_deg, CFG.beta_max_deg + 1e-9, grid_step)
     P = np.zeros((len(ys), len(xs)), dtype=float)
     COMM = np.zeros((len(ys), len(xs)), dtype=float)
+    COMM_Q = np.zeros((len(ys), len(xs)), dtype=float)  # 通信の“強さ”(0-100)
 
     if in_blackout(st.session_state.day):
-        for j, bo in enumerate(ys):
-            for i, bi in enumerate(xs):
-                P[j,i] = power_percent(beta_to_tilt(float(bi), float(bo)))
-                COMM[j,i] = 0.0
-    else:
-        for j, bo in enumerate(ys):
-            for i, bi in enumerate(xs):
-                tilt_ = beta_to_tilt(float(bi), float(bo))
-                P[j,i] = power_percent(tilt_)
-                ok = (tilt_ <= CFG.sun_tilt_limit_deg) and comm_ok(earth_aspect(sc, sun, earth, float(bi), float(bo)))
-                COMM[j,i] = 1.0 if ok else 0.0
+        st.warning("通信できない時間帯（ブラックアウト）です。βマップでは通信を0にします。")
+
+    # “ベクトル”から判定するβマップ（3Dタブと同じ考え方）
+    sun_dir = unit(sun_g - sc_g)
+    earth_dir = unit(earth_g - sc_g)
+
+    for j, bo in enumerate(ys):
+        for i, bi in enumerate(xs):
+            n = sail_normal(sc_g, sun_g, earth_g, float(bi), float(bo))
+
+            # でんき（太陽方向に近いほど大きい）
+            P[j, i] = power_percent_from_vectors(n, sun_dir)
+
+            if in_blackout(st.session_state.day):
+                COMM[j, i] = 0.0
+                COMM_Q[j, i] = 0.0
+            else:
+                earth_aspect_deg_ = angle_deg(n, earth_dir)
+                sun_aspect_deg_ = angle_deg(n, sun_dir)
+                ok = (sun_aspect_deg_ <= CFG.sun_tilt_limit_deg) and comm_ok(earth_aspect_deg_)
+                COMM[j, i] = 1.0 if ok else 0.0
+
+                # 通信の“強さ”(0-100)：地球方向がコーン中心に近いほど強い
+                cos60 = math.cos(math.radians(CFG.comm_ok_low_deg))
+                ea = float(earth_aspect_deg_)
+                # 近い側（0〜60度）
+                q1 = (math.cos(math.radians(ea)) - cos60) / (1.0 - cos60)
+                # 反対側（120〜180度）
+                ea2 = abs(180.0 - ea)
+                q2 = (math.cos(math.radians(ea2)) - cos60) / (1.0 - cos60)
+                q = max(0.0, min(1.0, max(q1, q2)))
+                COMM_Q[j, i] = 100.0*q if (sun_aspect_deg_ <= CFG.sun_tilt_limit_deg) else 0.0
 
     fig3 = go.Figure()
     fig3.add_trace(go.Heatmap(x=xs, y=ys, z=P, colorbar=dict(title="でんき(%)")))
@@ -454,6 +535,14 @@ with tab3:
     fig3.update_layout(xaxis_title="β_in (deg)", yaxis_title="β_out (deg)", height=650, margin=dict(l=10,r=10,t=10,b=10), showlegend=True)
     fig3.update_yaxes(scaleanchor="x", scaleratio=1)
     st.plotly_chart(fig3, use_container_width=True)
+    st.markdown("#### 通信のβマップ（強さ）")
+    fig3b = go.Figure()
+    fig3b.add_trace(go.Heatmap(x=xs, y=ys, z=COMM_Q, colorbar=dict(title="通信(0-100)")))
+    fig3b.add_trace(go.Scatter(x=[beta_in], y=[beta_out], mode="markers", name="いまのβ"))
+    fig3b.update_layout(xaxis_title="β_in (deg)", yaxis_title="β_out (deg)", height=650, margin=dict(l=10,r=10,t=10,b=10))
+    fig3b.update_yaxes(scaleanchor="x", scaleratio=1)
+    st.plotly_chart(fig3b, use_container_width=True)
+
 
     st.write(f"- 太陽からのかたむき: **{tilt:.1f}°**\n- でんき: **{pwr:.0f}%**\n- 地球に向けた角度: **{ea:.1f}°**\n- 通信: **{'できる' if comm_success else 'できない'}**")
 
@@ -462,9 +551,9 @@ with tab4:
     st.caption("軌道は描きません。IKAROSのまわりだけを、立体で見ます。")
 
     # いまのベクトル（IKAROSから見た向き）
-    sun_dir = unit(sun - sc)      # IKAROS→太陽
-    earth_dir = unit(earth - sc)  # IKAROS→地球
-    sail_n = sail_normal(sc, sun, earth, beta_in, beta_out)  # 帆面法線（β）
+    sun_dir = unit(sun_g - sc_g)      # IKAROS→太陽
+    earth_dir = unit(earth_g - sc_g)  # IKAROS→地球
+    sail_n = sail_normal(sc_g, sun_g, earth_g, beta_in, beta_out)  # 帆面法線（β）
 
     # 表示スケール（見やすさ）
     L = float(vec_scale)          # ベクトル長
@@ -526,8 +615,8 @@ with tab4:
 
     # 通信可能コーン：地球方向に対して 0〜60° または 120〜180°（= 反対向きから60°以内）
     # → 地球方向のコーン（半角60°）と、反対向きのコーン（半角60°）を描く
-    X1, Y1, Z1 = cone_surface(earth_dir, CFG.comm_ok_low_deg, Lc)
-    X2, Y2, Z2 = cone_surface(-earth_dir, CFG.comm_ok_low_deg, Lc)
+    X1, Y1, Z1 = cone_surface(sail_n, CFG.comm_ok_low_deg, Lc)
+    X2, Y2, Z2 = cone_surface(-sail_n, CFG.comm_ok_low_deg, Lc)
 
     fig4 = go.Figure()
     fig4.add_trace(vec_trace("太陽方向（IKAROS→太陽）", sun_dir))
@@ -548,7 +637,8 @@ with tab4:
 
     st.markdown("### かんたん説明")
     st.write(
-        "- **地球方向**のコーンの中に、帆の法線が入ると通信しやすい（このゲームのルール）\n"
+        "- **通信コーン**は、帆の法線（アンテナの向き）に固定されています。\n"
+        "  地球方向ベクトルがコーンの中に入ると通信しやすい（このゲームのルール）\n"
         "- **太陽方向**に近いほど、でんき（発電）が増える\n"
         "- **帆の平面**は「向きのイメージ」です（四角い板だと思ってOK）"
     )
