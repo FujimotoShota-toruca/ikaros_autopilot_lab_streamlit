@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
+APP_BUILD = "v7-2026-02-11"
+
 import streamlit as st
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -302,6 +304,7 @@ alpha_now = alpha_deg(sc_g, sun_g, earth_g)
 
 with st.sidebar:
     st.header("そうさ")
+    st.caption(f"Build: {APP_BUILD}")
     st.caption("データが無ければ模型で動きます。データがあれば本物寄りに動きます。")
     st.write(f"- mission_config.json: {'ある ✅' if isinstance(MISSION, dict) else 'ない'}")
     st.write(f"- orbit_schedule.json: {'ある ✅' if orbit_available() else 'ない'}")
@@ -401,11 +404,6 @@ tab1, tab2, tab3, tab4 = st.tabs(["B-plane（ねらい）","太陽系の図（2D
 with tab1:
     st.subheader("B-plane（ねらいの平面）")
 
-    # スコア（近いほど高い）
-    dist_km = float(np.linalg.norm(x_hat - target))
-    score_radius = 4.0 * float(CFG.tolerance_km)
-    score = int(max(0.0, round(100.0 * (1.0 - dist_km / (score_radius + 1e-12)))))
-    st.metric("スコア", f"{score}点")
 
     x_hat = np.array(st.session_state.x_hat, dtype=float)
     u = np.array([beta_in, beta_out], dtype=float)
@@ -417,6 +415,13 @@ with tab1:
 
     target = np.array(CFG.target_bt_br_km, dtype=float)
     tol = float(CFG.tolerance_km)
+
+    # スコア（近いほど高い）
+    x_hat_ss = np.array(st.session_state.x_hat, dtype=float)
+    dist_km = float(np.linalg.norm(x_hat_ss - target))
+    score_radius = 4.0 * float(CFG.tolerance_km)
+    score = int(max(0.0, round(100.0 * (1.0 - dist_km / (score_radius + 1e-12)))))
+    st.metric("スコア", f"{score}点")
 
     fig = go.Figure()
 
