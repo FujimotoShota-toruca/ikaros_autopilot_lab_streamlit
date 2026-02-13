@@ -20,7 +20,7 @@ import io
 import pathlib
 
 
-APP_BUILD = "v13.2-3d-fix-2026-02-14"
+APP_BUILD = "v13.3-3d-arrow-tip-2026-02-14"
 
 AU_KM = 149_597_870.7  # 1 AU in km
 DEFAULT_TEX_PATH = pathlib.Path(__file__).parent / "assets" / "ikaros_texture.png"
@@ -761,25 +761,29 @@ with tabs[3]:
 
     def add_vec(v: np.ndarray, name: str):
         vv = unit(v)
+        L = 1.05  # ベクトルの表示長さ（見た目用）
+        tip = L * vv
+
         # 線（マーカー無し）
         fig4.add_trace(go.Scatter3d(
-            x=[0, vv[0]], y=[0, vv[1]], z=[0, vv[2]],
+            x=[0, tip[0]], y=[0, tip[1]], z=[0, tip[2]],
             mode="lines", name=name
         ))
-        # 矢印の先端（Cone）
+
+        # 矢印の“先端だけ”を tip の位置に置く（原点に来ないようにする）
+        head_len = 0.35
         fig4.add_trace(go.Cone(
-            x=[0.0], y=[0.0], z=[0.0],
-            u=[vv[0]], v=[vv[1]], w=[vv[2]],
-            anchor="tail",
+            x=[float(tip[0])], y=[float(tip[1])], z=[float(tip[2])],
+            u=[float(head_len * vv[0])], v=[float(head_len * vv[1])], w=[float(head_len * vv[2])],
+            anchor="tip",
             showscale=False,
             sizemode="absolute",
             sizeref=0.22,
             name=name + "（矢印）",
             showlegend=False,
             hoverinfo="skip",
-            opacity=0.85,
+            opacity=0.9,
         ))
-
     add_vec(sun_dir, "太陽方向")
     add_vec(earth_dir, "地球方向")
     add_vec(sail_n, "帆面法線（アンテナ向き）")
