@@ -15,8 +15,13 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 
+from PIL import Image
+import io
 
-APP_BUILD = "v12.1-full-deterministic-2026-02-14"
+
+APP_BUILD = "v13-visual-physics-2026-02-14"
+
+AU_KM = 149_597_870.7  # 1 AU in km
 
 
 # -----------------------------
@@ -163,6 +168,48 @@ def comm_strength_0_100(sail_n: np.ndarray, earth_dir: np.ndarray) -> float:
         return 0.0
     return float(100.0 * (1.0 - ea / max(C.comm_cone_half_deg, 1e-9)))
 
+# -----------------------------
+# “物理っぽい”電力・通信（距離 + 指向性）
+# -----------------------------
+def power_percent_physical(sail_n: np.ndarray, sun_dir: np.ndarray, r_sun_au: float) -> float:
+    """
+    発電（相対％）の“物理っぽい”模型（簡易）
+    - 入射角：cos(theta)（0以下は0）
+    - 太陽距離：1/r^2（AU）
+    100% =「1 AUで真正面（theta=0）」のとき
+    """
+    inc = max(0.0, float(np.dot(unit(sail_n), unit(sun_dir))))
+    r = max(1e-6, float(r_sun_au))
+    return float(100.0 * inc / (r * r))
+
+
+def _gain_cos_n(angle_rad: float, half_power_deg: float) -> float:
+    """
+    cos^n パターンでアンテナ指向性を作る（簡易）
+    half_power_deg で gain=0.5 になるよう n を決める。
+    """
+    a = float(angle_rad)
+    if a >= math.pi / 2:
+        return 0.0
+    hp = math.radians(max(1e-3, float(half_power_deg)))
+    c_hp = max(1e-6, math.cos(hp))
+    n = math.log(0.5) / math.log(c_hp)
+    return float(max(0.0, math.cos(a)) ** n)
+
+
+def comm_rate_percent_physical(sail_n: np.ndarray, earth_dir: np.ndarray, r_earth_au: float, half_power_deg: float) -> float:
+    """
+    通信（相対％）の“物理っぽい”模型（簡易）
+    - 距離減衰：1/r^2（AU）
+    - 指向性：cos^n(角度)（half_power_deg で半減）
+    100% = 「1 AUでコーン中心（角度0）」のとき
+    """
+    r = max(1e-6, float(r_earth_au))
+    ang1 = math.radians(angle_deg(sail_n, earth_dir))
+    ang2 = math.radians(angle_deg(-sail_n, earth_dir))
+    ang = min(ang1, ang2)
+    gain = _gain_cos_n(ang, half_power_deg)
+    return float(100.0 * gain / (r * r))
 
 # -----------------------------
 # 状態遷移行列（感度行列）っぽいもの
@@ -322,6 +369,7 @@ def init_state() -> None:
 
     st.session_state.history = [st.session_state.x_hat.copy()]
     st.session_state.log: List[Dict[str, float]] = []
+    st.session_state.calc_mode = "物理（距離 + 指向性）"
 
 
 def step_once(beta_in: float, beta_out: float) -> None:
@@ -347,10 +395,20 @@ def step_once(beta_in: float, beta_out: float) -> None:
     earth_dir = unit(earth - sc)
     sail_n = sail_normal(sc, sun, earth, beta_in, beta_out)
 
-    pwr = power_percent(sail_n, sun_dir)
+    # 距離（AU）
+    r_sun_au = float(np.linalg.norm(sc - sun))
+    r_earth_au = float(np.linalg.norm(sc - earth))
+
     sun_aspect = angle_deg(sail_n, sun_dir)
-    comm = (not in_blackout(day)) and (sun_aspect <= C.sun_tilt_limit_deg) and comm_ok(sail_n, earth_dir)
-    comm_q = 0.0 if (in_blackout(day) or sun_aspect > C.sun_tilt_limit_deg) else comm_strength_0_100(sail_n, earth_dir)
+
+    if str(st.session_state.get("calc_mode", "")).startswith("物理"):
+        pwr = power_percent_physical(sail_n, sun_dir, r_sun_au)
+        comm_q = comm_rate_percent_physical(sail_n, earth_dir, r_earth_au, C.comm_cone_half_deg)
+        comm = comm_q >= 8.0
+    else:
+        pwr = power_percent(sail_n, sun_dir)
+        comm = (not in_blackout(day)) and (sun_aspect <= C.sun_tilt_limit_deg) and comm_ok(sail_n, earth_dir)
+        comm_q = 100.0 if comm else 0.0
 
     # 通信できたら推定が良くなる（測位アップデートの模型）
     if comm:
@@ -391,7 +449,7 @@ st.caption(f"Build: {APP_BUILD} / 乱数なし（同じ操作→同じ結果）"
 # ここで「必要な変数が全部そろっているか」をチェックして、足りなければ初期化します。
 REQUIRED_KEYS = [
     "turn", "day", "k_true", "k_hat",
-    "x_true", "x_hat", "history", "log",
+    "x_true", "x_hat", "history", "log", "calc_mode",
 ]
 
 def ensure_state() -> None:
@@ -420,6 +478,15 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    st.header("電力・通信の計算モード")
+    mode_phys = st.radio(
+        "選んでね",
+        ["物理（距離 + 指向性）", "簡易（コーン + 角度）"],
+        index=0,
+        help="物理：距離(1/r^2)と指向性(cos^n)で連続的に計算します。簡易：コーンに入ったらOK、というルールです。",
+    )
+    st.session_state.calc_mode = mode_phys
+
     st.header("本格っぽい中身")
     st.write("状態遷移（模型）")
     st.code("x_{k+1} = x_k + drift + k · C(k) · [β_in, β_out]^T", language="text")
@@ -443,9 +510,20 @@ sun_dir = unit(sun - sc)
 earth_dir = unit(earth - sc)
 sail_n_now = sail_normal(sc, sun, earth, beta_in, beta_out)
 
-pwr_now = power_percent(sail_n_now, sun_dir)
+# 距離（AU）
+r_sun_au = float(np.linalg.norm(sc - sun))
+r_earth_au = float(np.linalg.norm(sc - earth))
+
 sun_aspect_now = angle_deg(sail_n_now, sun_dir)
-comm_now = (not in_blackout(day)) and (sun_aspect_now <= C.sun_tilt_limit_deg) and comm_ok(sail_n_now, earth_dir)
+
+if mode_phys.startswith("物理"):
+    pwr_now = power_percent_physical(sail_n_now, sun_dir, r_sun_au)
+    comm_rate_now = comm_rate_percent_physical(sail_n_now, earth_dir, r_earth_au, C.comm_cone_half_deg)
+    comm_now = comm_rate_now >= 8.0
+else:
+    pwr_now = power_percent(sail_n_now, sun_dir)
+    comm_now = (not in_blackout(day)) and (sun_aspect_now <= C.sun_tilt_limit_deg) and comm_ok(sail_n_now, earth_dir)
+    comm_rate_now = 100.0 if comm_now else 0.0
 
 # 予測（次）
 C_hat = st.session_state.k_hat * get_sensitivity(turn)
@@ -457,13 +535,14 @@ pred_r = 2200.0  # ばらつき表示（固定の目安）
 d_now = float(np.linalg.norm(x_hat - target))
 score_now = score_from_distance(d_now)
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("ターン", f"{turn+1}/{C.n_turns}")
 c2.metric("経過日数", f"{day:.0f} / {C.total_days:.0f} 日")
 c3.metric("距離（推定）", f"{d_now:,.0f} km")
 c4.metric("スコア（目安）", f"{score_now} 点")
-c5.metric("発電（模型）", f"{pwr_now:.0f} %")
-c6.metric("通信（模型）", "OK ✅" if comm_now else "NG ❌")
+c5.metric("発電量（相対）", f"{pwr_now:.0f} %")
+c6.metric("通信", "OK ✅" if comm_now else "NG ❌")
+c7.metric("通信量（相対）", f"{comm_rate_now:.0f} %")
 
 
 tabs = st.tabs(["B-plane（ダーツ盤）", "太陽系2D（雰囲気）", "βマップ（発電/通信）", "3D（ベクトル）"])
@@ -505,10 +584,17 @@ with tabs[1]:
         S.append(sc2)
     E = np.array(E); V = np.array(V); S = np.array(S)
 
+    # いまの時刻まで＝実行済み / これから先＝未実行
+    idx_now = int(np.searchsorted(days, day))
+    idx_now = max(1, min(idx_now, len(days)-1))
+
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=E[:,0], y=E[:,1], mode="lines", name="地球の軌道（雰囲気）"))
-    fig2.add_trace(go.Scatter(x=V[:,0], y=V[:,1], mode="lines", name="金星の軌道（雰囲気）"))
-    fig2.add_trace(go.Scatter(x=S[:,0], y=S[:,1], mode="lines", name="IKAROS（雰囲気）"))
+    fig2.add_trace(go.Scatter(x=E[:idx_now,0], y=E[:idx_now,1], mode="lines", name="地球（実行済み）", line=dict(dash="dot")))
+    fig2.add_trace(go.Scatter(x=E[idx_now:,0], y=E[idx_now:,1], mode="lines", name="地球（未実行）", line=dict(dash="dash")))
+    fig2.add_trace(go.Scatter(x=V[:idx_now,0], y=V[:idx_now,1], mode="lines", name="金星（実行済み）", line=dict(dash="dot")))
+    fig2.add_trace(go.Scatter(x=V[idx_now:,0], y=V[idx_now:,1], mode="lines", name="金星（未実行）", line=dict(dash="dash")))
+    fig2.add_trace(go.Scatter(x=S[:idx_now,0], y=S[:idx_now,1], mode="lines", name="IKAROS（実行済み）", line=dict(dash="dot")))
+    fig2.add_trace(go.Scatter(x=S[idx_now:,0], y=S[idx_now:,1], mode="lines", name="IKAROS（未実行）", line=dict(dash="dash")))
 
     fig2.add_trace(go.Scatter(x=[0.0], y=[0.0], mode="markers+text", name="太陽", text=["☀"], textposition="top center"))
     fig2.add_trace(go.Scatter(x=[earth[0]], y=[earth[1]], mode="markers+text", name="地球（いま）", text=["🌍"], textposition="top center"))
@@ -535,18 +621,22 @@ with tabs[2]:
     for j, bo in enumerate(ys):
         for i, bi in enumerate(xs):
             n = sail_normal(sc, sun, earth, float(bi), float(bo))
-            P[j, i] = power_percent(n, sun_dir)
-
-            sun_aspect = angle_deg(n, sun_dir)
-            if in_blackout(day) or sun_aspect > C.sun_tilt_limit_deg:
-                COMM[j, i] = 0.0
-                COMM_Q[j, i] = 0.0
+            if mode_phys.startswith("物理"):
+                P[j, i] = power_percent_physical(n, sun_dir, r_sun_au)
+                COMM_Q[j, i] = comm_rate_percent_physical(n, earth_dir, r_earth_au, C.comm_cone_half_deg)
+                COMM[j, i] = 1.0 if COMM_Q[j, i] >= 8.0 else 0.0
             else:
-                ok = comm_ok(n, earth_dir)
-                COMM[j, i] = 1.0 if ok else 0.0
-                COMM_Q[j, i] = comm_strength_0_100(n, earth_dir)
+                P[j, i] = power_percent(n, sun_dir)
+                sun_aspect = angle_deg(n, sun_dir)
+                if in_blackout(day) or sun_aspect > C.sun_tilt_limit_deg:
+                    COMM[j, i] = 0.0
+                    COMM_Q[j, i] = 0.0
+                else:
+                    ok = comm_ok(n, earth_dir)
+                    COMM[j, i] = 1.0 if ok else 0.0
+                    COMM_Q[j, i] = comm_strength_0_100(n, earth_dir)
 
-    if in_blackout(day):
+    if (not mode_phys.startswith("物理")) and in_blackout(day):
         st.warning("いまはブラックアウト中（通信できない時間帯）です。")
 
     fig3 = go.Figure()
@@ -576,9 +666,67 @@ with tabs[3]:
     st.subheader("3D（ベクトル：太陽/地球/帆法線/通信コーン）")
     st.write("軌道線は描かず、いまの姿勢と方向ベクトルだけ表示します。")
 
+    # IKAROSの見た目：画像を入れると“それっぽく”なります（任意）
+    up = st.file_uploader("IKAROS画像（任意：PNG/JPG）", type=["png", "jpg", "jpeg"])
+    tex_img = None
+    if up is not None:
+        try:
+            tex_img = Image.open(io.BytesIO(up.read())).convert("L")  # グレースケール
+        except Exception:
+            tex_img = None
+
     sail_n = sail_n_now
 
     fig4 = go.Figure()
+
+    # ---- IKAROSの帆（平面）を3Dで表示 ----
+    axis = unit(sail_n)
+    a = np.array([0.0, 0.0, 1.0])
+    b1 = np.cross(axis, a)
+    if norm(b1) < 1e-6:
+        a = np.array([0.0, 1.0, 0.0])
+        b1 = np.cross(axis, a)
+    b1 = unit(b1)
+    b2 = unit(np.cross(axis, b1))
+
+    sail_half = 0.75  # 表示サイズ（見た目用）
+    uu = np.linspace(-1.0, 1.0, 40)
+    vv = np.linspace(-1.0, 1.0, 40)
+    Xs = np.zeros((len(vv), len(uu)))
+    Ys = np.zeros((len(vv), len(uu)))
+    Zs = np.zeros((len(vv), len(uu)))
+
+    if tex_img is not None:
+        img2 = tex_img.resize((len(uu), len(vv)))
+        tex = np.array(img2, dtype=float) / 255.0
+    else:
+        U, V = np.meshgrid(np.linspace(-1, 1, len(uu)), np.linspace(-1, 1, len(vv)))
+        tex = 0.25 + 0.75 * (np.exp(-((U*4)**2)) + np.exp(-((V*4)**2)))
+        tex = np.clip(tex, 0.0, 1.0)
+
+    for j, v in enumerate(vv):
+        for i, u in enumerate(uu):
+            p = sail_half * (u * b1 + v * b2)
+            Xs[j, i], Ys[j, i], Zs[j, i] = float(p[0]), float(p[1]), float(p[2])
+
+    fig4.add_trace(go.Surface(
+        x=Xs, y=Ys, z=Zs,
+        surfacecolor=tex,
+        colorscale="Gray",
+        showscale=False,
+        opacity=0.95,
+        name="IKAROS帆（平面）",
+        hoverinfo="skip",
+    ))
+
+    fig4.add_trace(go.Scatter3d(
+        x=[0.0], y=[0.0], z=[0.0],
+        mode="markers+text",
+        text=["IKAROS"],
+        textposition="top center",
+        name="本体",
+        marker=dict(size=5),
+    ))
 
     def add_vec(v: np.ndarray, name: str):
         vv = unit(v)
@@ -634,7 +782,8 @@ with tabs[3]:
         "- **帆面法線（アンテナ向き）**を中心に、通信コーンを置いています。\n"
         "  地球方向ベクトルがコーンの中に入ると通信しやすい（このゲームのルール）\n"
         "- **太陽方向**に近いほど、発電が増える\n"
-        "- ここでは軌道の線は描かず、“向き”だけを見ます"
+        "- ここでは軌道の線は描かず、“向き”だけを見ます\n"
+        "- 画像をアップロードすると、帆の見た目が画像っぽくなります（グレー表示）"
     )
 
 with st.expander("ログ（確認用）"):
