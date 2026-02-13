@@ -17,11 +17,13 @@ import plotly.graph_objects as go
 
 from PIL import Image
 import io
+import pathlib
 
 
-APP_BUILD = "v13-visual-physics-2026-02-14"
+APP_BUILD = "v13.1-visual-physics-2026-02-14"
 
 AU_KM = 149_597_870.7  # 1 AU in km
+DEFAULT_TEX_PATH = pathlib.Path(__file__).parent / "assets" / "ikaros_texture.png"
 
 
 # -----------------------------
@@ -180,7 +182,7 @@ def power_percent_physical(sail_n: np.ndarray, sun_dir: np.ndarray, r_sun_au: fl
     """
     inc = max(0.0, float(np.dot(unit(sail_n), unit(sun_dir))))
     r = max(1e-6, float(r_sun_au))
-    return float(100.0 * inc / (r * r))
+    return float(min(100.0, 100.0 * inc / (r * r)))
 
 
 def _gain_cos_n(angle_rad: float, half_power_deg: float) -> float:
@@ -209,7 +211,7 @@ def comm_rate_percent_physical(sail_n: np.ndarray, earth_dir: np.ndarray, r_eart
     ang2 = math.radians(angle_deg(-sail_n, earth_dir))
     ang = min(ang1, ang2)
     gain = _gain_cos_n(ang, half_power_deg)
-    return float(100.0 * gain / (r * r))
+    return float(min(100.0, 100.0 * gain / (r * r)))
 
 # -----------------------------
 # 状態遷移行列（感度行列）っぽいもの
@@ -540,7 +542,7 @@ c1.metric("ターン", f"{turn+1}/{C.n_turns}")
 c2.metric("経過日数", f"{day:.0f} / {C.total_days:.0f} 日")
 c3.metric("距離（推定）", f"{d_now:,.0f} km")
 c4.metric("スコア（目安）", f"{score_now} 点")
-c5.metric("発電量（相対）", f"{pwr_now:.0f} %")
+c5.metric("発電量（0-100%）", f"{pwr_now:.0f} %")
 c6.metric("通信", "OK ✅" if comm_now else "NG ❌")
 c7.metric("通信量（相対）", f"{comm_rate_now:.0f} %")
 
@@ -589,11 +591,11 @@ with tabs[1]:
     idx_now = max(1, min(idx_now, len(days)-1))
 
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=E[:idx_now,0], y=E[:idx_now,1], mode="lines", name="地球（実行済み）", line=dict(dash="dot")))
+    fig2.add_trace(go.Scatter(x=E[:idx_now,0], y=E[:idx_now,1], mode="lines", name="地球（実行済み）", line=dict(dash="solid")))
     fig2.add_trace(go.Scatter(x=E[idx_now:,0], y=E[idx_now:,1], mode="lines", name="地球（未実行）", line=dict(dash="dash")))
-    fig2.add_trace(go.Scatter(x=V[:idx_now,0], y=V[:idx_now,1], mode="lines", name="金星（実行済み）", line=dict(dash="dot")))
+    fig2.add_trace(go.Scatter(x=V[:idx_now,0], y=V[:idx_now,1], mode="lines", name="金星（実行済み）", line=dict(dash="solid")))
     fig2.add_trace(go.Scatter(x=V[idx_now:,0], y=V[idx_now:,1], mode="lines", name="金星（未実行）", line=dict(dash="dash")))
-    fig2.add_trace(go.Scatter(x=S[:idx_now,0], y=S[:idx_now,1], mode="lines", name="IKAROS（実行済み）", line=dict(dash="dot")))
+    fig2.add_trace(go.Scatter(x=S[:idx_now,0], y=S[:idx_now,1], mode="lines", name="IKAROS（実行済み）", line=dict(dash="solid")))
     fig2.add_trace(go.Scatter(x=S[idx_now:,0], y=S[idx_now:,1], mode="lines", name="IKAROS（未実行）", line=dict(dash="dash")))
 
     fig2.add_trace(go.Scatter(x=[0.0], y=[0.0], mode="markers+text", name="太陽", text=["☀"], textposition="top center"))
@@ -675,6 +677,13 @@ with tabs[3]:
         except Exception:
             tex_img = None
 
+    # 画像をアップロードしなかった場合は、同梱のデフォルト画像を使う
+    if tex_img is None and DEFAULT_TEX_PATH.exists():
+        try:
+            tex_img = Image.open(DEFAULT_TEX_PATH).convert("L")
+        except Exception:
+            tex_img = None
+
     sail_n = sail_n_now
 
     fig4 = go.Figure()
@@ -709,13 +718,33 @@ with tabs[3]:
             p = sail_half * (u * b1 + v * b2)
             Xs[j, i], Ys[j, i], Zs[j, i] = float(p[0]), float(p[1]), float(p[2])
 
+    # 薄い直方体っぽくするため、表と裏の2枚を描きます（厚みは少しだけ）
+    thickness = 0.06  # 見た目用（小さいほど薄い）
+    Xt = Xs + (thickness / 2.0) * axis[0]
+    Yt = Ys + (thickness / 2.0) * axis[1]
+    Zt = Zs + (thickness / 2.0) * axis[2]
+
+    Xb = Xs - (thickness / 2.0) * axis[0]
+    Yb = Ys - (thickness / 2.0) * axis[1]
+    Zb = Zs - (thickness / 2.0) * axis[2]
+
     fig4.add_trace(go.Surface(
-        x=Xs, y=Ys, z=Zs,
+        x=Xt, y=Yt, z=Zt,
         surfacecolor=tex,
         colorscale="Gray",
         showscale=False,
-        opacity=0.95,
-        name="IKAROS帆（平面）",
+        opacity=0.98,
+        name="IKAROS帆（表）",
+        hoverinfo="skip",
+    ))
+
+    fig4.add_trace(go.Surface(
+        x=Xb, y=Yb, z=Zb,
+        surfacecolor=tex,
+        colorscale="Gray",
+        showscale=False,
+        opacity=0.98,
+        name="IKAROS帆（裏）",
         hoverinfo="skip",
     ))
 
@@ -763,7 +792,10 @@ with tabs[3]:
         return X, Y, Z
 
     X, Y, Z = cone_surface(sail_n, C.comm_cone_half_deg, 0.9, 50, 40)
-    fig4.add_trace(go.Surface(x=X, y=Y, z=Z, showscale=False, opacity=0.2, name="通信コーン"))
+    fig4.add_trace(go.Surface(x=X, y=Y, z=Z, showscale=False, opacity=0.2, name="通信コーン（表）"))
+
+    X2, Y2, Z2 = cone_surface(-sail_n, C.comm_cone_half_deg, 0.9, 50, 40)
+    fig4.add_trace(go.Surface(x=X2, y=Y2, z=Z2, showscale=False, opacity=0.2, name="通信コーン（裏）"))
 
     fig4.update_layout(
         scene=dict(
