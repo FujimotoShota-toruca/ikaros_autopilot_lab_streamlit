@@ -20,7 +20,7 @@ import io
 import pathlib
 
 
-APP_BUILD = "v13.3-3d-arrow-tip-2026-02-14"
+APP_BUILD = "v13.4-orbit-comm-power-2026-02-14"
 
 AU_KM = 149_597_870.7  # 1 AU in km
 DEFAULT_TEX_PATH = pathlib.Path(__file__).parent / "assets" / "ikaros_texture.png"
@@ -85,9 +85,13 @@ C = CFG()
 def get_positions_3d(day: float, total_days: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     太陽・地球・金星・IKAROS の“雰囲気”位置（3Dだけど z=0）
+    - 地球/金星：円軌道（超ざっくり）
+    - IKAROS：地球(出発)→金星(到着)を結ぶ “ベジェ曲線” の1本
+      ※最後は必ず「金星の位置」と一致します（見た目を気持ちよくするため）
     単位は AU（天文単位）っぽい相対値。
     """
     t = day / max(total_days, 1e-9)
+    t = float(np.clip(t, 0.0, 1.0))
 
     # 太陽
     sun = np.zeros(3)
@@ -102,11 +106,26 @@ def get_positions_3d(day: float, total_days: float) -> Tuple[np.ndarray, np.ndar
     thV = wV * day - 0.8
     venus = 0.723 * np.array([math.cos(thV), math.sin(thV), 0.0], dtype=float)
 
-    # IKAROS：地球付近→金星付近へ「半径と角度を少しずつ」寄せる
-    r0, r1 = 1.0, 0.723
-    r = (1 - t) * r0 + t * r1
-    th = (1 - t) * thE + t * thV + 0.6 * t  # ちょいねじる
-    sc = r * np.array([math.cos(th), math.sin(th), 0.0], dtype=float)
+    # --- IKAROSの“転移曲線”：出発(地球@day0)→到着(金星@day=total_days) ---
+    thE0 = 0.2
+    earth0 = np.array([math.cos(thE0), math.sin(thE0), 0.0], dtype=float)
+
+    thVF = wV * total_days - 0.8
+    venusF = 0.723 * np.array([math.cos(thVF), math.sin(thVF), 0.0], dtype=float)
+
+    # 速度っぽい向き（円軌道の接線方向）
+    tanE = unit(np.array([-earth0[1], earth0[0], 0.0], dtype=float))
+    tanV = unit(np.array([-venusF[1], venusF[0], 0.0], dtype=float))
+
+    # 制御点（曲がり具合）
+    L = 0.55 * norm(earth0 - venusF)
+    p0 = earth0
+    p1 = earth0 + L * tanE
+    p2 = venusF - L * tanV
+    p3 = venusF
+
+    # 3次ベジェ
+    sc = ((1 - t) ** 3) * p0 + 3 * ((1 - t) ** 2) * t * p1 + 3 * (1 - t) * (t ** 2) * p2 + (t ** 3) * p3
     return sun, earth, venus, sc
 
 
@@ -371,9 +390,6 @@ def init_state() -> None:
 
     st.session_state.history = [st.session_state.x_hat.copy()]
     st.session_state.log: List[Dict[str, float]] = []
-    st.session_state.calc_mode = "物理（距離 + 指向性）"
-
-
 def step_once(beta_in: float, beta_out: float) -> None:
     turn = int(st.session_state.turn)
     if turn >= C.n_turns - 1:
@@ -403,14 +419,12 @@ def step_once(beta_in: float, beta_out: float) -> None:
 
     sun_aspect = angle_deg(sail_n, sun_dir)
 
-    if str(st.session_state.get("calc_mode", "")).startswith("物理"):
-        pwr = power_percent_physical(sail_n, sun_dir, r_sun_au)
-        comm_q = comm_rate_percent_physical(sail_n, earth_dir, r_earth_au, C.comm_cone_half_deg)
-        comm = comm_q >= 8.0
-    else:
-        pwr = power_percent(sail_n, sun_dir)
-        comm = (not in_blackout(day)) and (sun_aspect <= C.sun_tilt_limit_deg) and comm_ok(sail_n, earth_dir)
-        comm_q = 100.0 if comm else 0.0
+    # 発電：太陽方向との内積（cos）で 0〜100%
+    pwr = power_percent(sail_n, sun_dir)
+
+    # 通信：地球方向が「±帆法線」から 60°以内ならOK（それ以外はNG）
+    comm = comm_ok(sail_n, earth_dir)
+    comm_q = comm_strength_0_100(sail_n, earth_dir)
 
     # 通信できたら推定が良くなる（測位アップデートの模型）
     if comm:
@@ -451,7 +465,7 @@ st.caption(f"Build: {APP_BUILD} / 乱数なし（同じ操作→同じ結果）"
 # ここで「必要な変数が全部そろっているか」をチェックして、足りなければ初期化します。
 REQUIRED_KEYS = [
     "turn", "day", "k_true", "k_hat",
-    "x_true", "x_hat", "history", "log", "calc_mode",
+    "x_true", "x_hat", "history", "log",
 ]
 
 def ensure_state() -> None:
@@ -478,16 +492,6 @@ with st.sidebar:
     if st.button("実行！（このターンを進める）", disabled=not can_step):
         step_once(beta_in, beta_out)
         st.rerun()
-
-    st.divider()
-    st.header("電力・通信の計算モード")
-    mode_phys = st.radio(
-        "選んでね",
-        ["物理（距離 + 指向性）", "簡易（コーン + 角度）"],
-        index=0,
-        help="物理：距離(1/r^2)と指向性(cos^n)で連続的に計算します。簡易：コーンに入ったらOK、というルールです。",
-    )
-    st.session_state.calc_mode = mode_phys
 
     st.header("本格っぽい中身")
     st.write("状態遷移（模型）")
@@ -518,14 +522,12 @@ r_earth_au = float(np.linalg.norm(sc - earth))
 
 sun_aspect_now = angle_deg(sail_n_now, sun_dir)
 
-if mode_phys.startswith("物理"):
-    pwr_now = power_percent_physical(sail_n_now, sun_dir, r_sun_au)
-    comm_rate_now = comm_rate_percent_physical(sail_n_now, earth_dir, r_earth_au, C.comm_cone_half_deg)
-    comm_now = comm_rate_now >= 8.0
-else:
-    pwr_now = power_percent(sail_n_now, sun_dir)
-    comm_now = (not in_blackout(day)) and (sun_aspect_now <= C.sun_tilt_limit_deg) and comm_ok(sail_n_now, earth_dir)
-    comm_rate_now = 100.0 if comm_now else 0.0
+    # 発電：太陽方向との内積（cos）で 0〜100%
+pwr_now = power_percent(sail_n_now, sun_dir)
+
+    # 通信：地球方向が「±帆法線」から 60°以内ならOK（それ以外はNG）
+comm_now = comm_ok(sail_n_now, earth_dir)
+comm_rate_now = comm_strength_0_100(sail_n_now, earth_dir)
 
 # 予測（次）
 C_hat = st.session_state.k_hat * get_sensitivity(turn)
@@ -544,7 +546,7 @@ c3.metric("距離（推定）", f"{d_now:,.0f} km")
 c4.metric("スコア（目安）", f"{score_now} 点")
 c5.metric("発電量（0-100%）", f"{pwr_now:.0f} %")
 c6.metric("通信", "OK ✅" if comm_now else "NG ❌")
-c7.metric("通信量（相対）", f"{comm_rate_now:.0f} %")
+c7.metric("通信の強さ（0-100）", f"{comm_rate_now:.0f} %")
 
 
 tabs = st.tabs(["B-plane（ダーツ盤）", "太陽系2D（雰囲気）", "βマップ（発電/通信）", "3D（ベクトル）"])
@@ -610,7 +612,7 @@ with tabs[1]:
     st.write("※これは“雰囲気”の絵です（本当の軌道計算ではありません）。")
 
 with tabs[2]:
-    st.subheader("βマップ（発電と通信）")
+    st.subheader("βマップ（発電：cos / 通信：60°ルール）")
     st.write("いまの幾何（太陽・地球の方向）で、β_in/out を動かしたときの発電と通信を見ます。")
 
     xs = np.linspace(-C.beta_in_deg_lim, C.beta_in_deg_lim, 71)
@@ -623,23 +625,14 @@ with tabs[2]:
     for j, bo in enumerate(ys):
         for i, bi in enumerate(xs):
             n = sail_normal(sc, sun, earth, float(bi), float(bo))
-            if mode_phys.startswith("物理"):
-                P[j, i] = power_percent_physical(n, sun_dir, r_sun_au)
-                COMM_Q[j, i] = comm_rate_percent_physical(n, earth_dir, r_earth_au, C.comm_cone_half_deg)
-                COMM[j, i] = 1.0 if COMM_Q[j, i] >= 8.0 else 0.0
-            else:
-                P[j, i] = power_percent(n, sun_dir)
-                sun_aspect = angle_deg(n, sun_dir)
-                if in_blackout(day) or sun_aspect > C.sun_tilt_limit_deg:
-                    COMM[j, i] = 0.0
-                    COMM_Q[j, i] = 0.0
-                else:
-                    ok = comm_ok(n, earth_dir)
-                    COMM[j, i] = 1.0 if ok else 0.0
-                    COMM_Q[j, i] = comm_strength_0_100(n, earth_dir)
 
-    if (not mode_phys.startswith("物理")) and in_blackout(day):
-        st.warning("いまはブラックアウト中（通信できない時間帯）です。")
+            # 発電：太陽との内積（cos）で 0〜100%
+            P[j, i] = power_percent(n, sun_dir)
+
+            # 通信：60°以内ならOK（1） / それ以外はNG（0）
+            ok = comm_ok(n, earth_dir)
+            COMM[j, i] = 1.0 if ok else 0.0
+            COMM_Q[j, i] = comm_strength_0_100(n, earth_dir)
 
     fig3 = go.Figure()
     fig3.add_trace(go.Heatmap(x=xs, y=ys, z=P, colorbar=dict(title="発電(%)")))
@@ -648,7 +641,7 @@ with tabs[2]:
     fig3.update_yaxes(scaleanchor="x", scaleratio=1)
     st.plotly_chart(fig3, use_container_width=True)
 
-    st.markdown("#### 通信のβマップ（OK/NG）")
+    st.markdown("#### 通信のβマップ（60°以内ならOK）")
     fig3a = go.Figure()
     fig3a.add_trace(go.Heatmap(x=xs, y=ys, z=COMM, colorbar=dict(title="通信OK(0/1)")))
     fig3a.add_trace(go.Scatter(x=[beta_in], y=[beta_out], mode="markers", name="いまのβ"))
