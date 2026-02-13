@@ -1,649 +1,376 @@
-\
+# IKAROS-GO! (Darts-first / S-mode)
+# Streamlit app - educational parody game inspired by IKAROS solar-sail guidance.
+#
+# ねらい：
+# - 「膜（帆）の向きを変えると、軌道が変わる！」を体験できる
+# - 難しいB-planeの理屈は“裏側”にして、ゲームとして気持ちよく遊べることを優先する
+#
+# 操作（IKAROSに立ち返る）
+# - 開き量：調整しない（面積は固定だと思ってOK）
+# - α（アルファ）：太陽にどれくらい正面？ → 押す強さ（効き）
+# - β（ベータ）：どっち方向に押す？ → B-plane上の移動方向
+#
+# 将来の拡張（あとで入れやすいように）
+# - 通信/発電の制約、βマップ、3D可視化、データ生成…などは別モードとして追加可能
+
 from __future__ import annotations
 
-import json
 import math
-from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Tuple, List, Dict
 
 import numpy as np
-import plotly.graph_objects as go
-APP_BUILD = "v7-2026-02-11"
-
 import streamlit as st
+import plotly.graph_objects as go
 
-DATA_DIR = Path(__file__).parent / "data"
+APP_BUILD = "v8-darts-S-2026-02-13"
 
-# -----------------------------
-# 設定（デフォルト）
-# -----------------------------
-@dataclass
-class GameConfig:
-    n_turns: int = 14
-    turn_days: int = 14
 
-    target_bt_br_km: Tuple[float, float] = (0.0, 0.0)
-    tolerance_km: float = 30.0
+# ----------------------------
+# 基本ユーティリティ
+# ----------------------------
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-    beta_max_deg: float = 15.0
-    beta_step_deg: float = 0.5
-
-    process_noise_km: float = 3.0
-    meas_noise_km: float = 6.0
-    init_est_noise_km: float = 25.0
-
-    # βが0でもズレる（模型）：見えない“ゆっくりドリフト”
-    drift_per_turn_km: float = 6.0
-
-    sun_tilt_limit_deg: float = 45.0
-    comm_ok_low_deg: float = 60.0
-    comm_ok_high_deg: float = 120.0
-
-    blackout_start_day: float = 100.0
-    blackout_end_day: float = 130.0
-
-    init_bt_br_km: Tuple[float, float] = (120.0, -80.0)
-
-CFG = GameConfig()
-
-def load_json(path: Path) -> Optional[object]:
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-MISSION = load_json(DATA_DIR / "mission_config.json")
-if isinstance(MISSION, dict):
-    try:
-        CFG = replace(
-            CFG,
-            n_turns=int(MISSION.get("n_turns", CFG.n_turns)),
-            turn_days=int(MISSION.get("turn_days", CFG.turn_days)),
-            tolerance_km=float(MISSION.get("tolerance_km", CFG.tolerance_km)),
-            sun_tilt_limit_deg=float(MISSION.get("sun_tilt_limit_deg", CFG.sun_tilt_limit_deg)),
-            blackout_start_day=float(MISSION.get("blackout_start_day", CFG.blackout_start_day)),
-            blackout_end_day=float(MISSION.get("blackout_end_day", CFG.blackout_end_day)),
-        )
-        tb = MISSION.get("target_bt_br_km", None)
-        if isinstance(tb, list) and len(tb) == 2:
-            CFG = replace(CFG, target_bt_br_km=(float(tb[0]), float(tb[1])))
-        ib = MISSION.get("init_bt_br_km", None)
-        if isinstance(ib, list) and len(ib) == 2:
-            CFG = replace(CFG, init_bt_br_km=(float(ib[0]), float(ib[1])))
-    except Exception:
-        pass
-
-ORBIT_DATA = load_json(DATA_DIR / "orbit_schedule.json")
-SENS_DATA = load_json(DATA_DIR / "sensitivity_schedule.json")
-
-def orbit_available() -> bool:
-    return isinstance(ORBIT_DATA, list) and len(ORBIT_DATA) >= 2
-
-def sens_available() -> bool:
-    return isinstance(SENS_DATA, list) and len(SENS_DATA) >= 1
-
-# -----------------------------
-# ベクトル便利
-# -----------------------------
-def norm(v: np.ndarray) -> float:
-    return float(np.linalg.norm(v))
 
 def unit(v: np.ndarray) -> np.ndarray:
-    n = norm(v)
-    if n < 1e-12:
-        return v * 0.0
-    return v / n
-
-def angle_deg(u: np.ndarray, v: np.ndarray) -> float:
-    c = float(np.clip(np.dot(unit(u), unit(v)), -1.0, 1.0))
-    return float(np.degrees(np.arccos(c)))
-
-def smoothstep(x: float) -> float:
-    x = max(0.0, min(1.0, x))
-    return x*x*(3-2*x)
-
-def _vec(entry: Dict[str, object], key: str) -> Optional[np.ndarray]:
-    v = entry.get(key, None)
-    if not isinstance(v, list):
-        return None
-    if len(v) == 2:
-        return np.array([float(v[0]), float(v[1]), 0.0], dtype=float)
-    if len(v) == 3:
-        return np.array([float(v[0]), float(v[1]), float(v[2])], dtype=float)
-    return None
-
-def get_positions_3d(day: float, total_days: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    if orbit_available():
-        data = [d for d in ORBIT_DATA if isinstance(d, dict) and "day" in d]
-        data.sort(key=lambda d: float(d.get("day", 0.0)))
-        if len(data) >= 2:
-            # bracket
-            if day <= float(data[0]["day"]):
-                e0, e1 = data[0], data[1]
-            elif day >= float(data[-1]["day"]):
-                e0, e1 = data[-2], data[-1]
-            else:
-                e0, e1 = data[0], data[1]
-                for i in range(len(data)-1):
-                    d0 = float(data[i]["day"]); d1 = float(data[i+1]["day"])
-                    if d0 <= day <= d1:
-                        e0, e1 = data[i], data[i+1]
-                        break
-            d0 = float(e0["day"]); d1 = float(e1["day"])
-            t = 0.0 if abs(d1-d0) < 1e-12 else (day-d0)/(d1-d0)
-
-            def lerp(key: str) -> Optional[np.ndarray]:
-                v0 = _vec(e0, key); v1 = _vec(e1, key)
-                if v0 is None or v1 is None:
-                    return None
-                return (1-t)*v0 + t*v1
-
-            sun = lerp("sun"); earth = lerp("earth"); venus = lerp("venus"); sc = lerp("ikaros")
-            if sun is not None and earth is not None and venus is not None and sc is not None:
-                return sun, earth, venus, sc
-
-    # fallback toy
-    EARTH_AU = 1.0
-    VENUS_AU = 0.723
-    EARTH_PERIOD_D = 365.25
-    VENUS_PERIOD_D = 224.7
-
-    def planet(day_: float, a: float, P: float, phase: float) -> np.ndarray:
-        th = 2*math.pi*(day_/P) + phase
-        return np.array([a*math.cos(th), a*math.sin(th), 0.0], dtype=float)
-
-    def sc_pos(day_: float) -> np.ndarray:
-        f = smoothstep(day_/total_days)
-        r = EARTH_AU - (EARTH_AU - VENUS_AU)*f
-        omega = 2*math.pi/320.0
-        th = 2*math.pi*(day_/EARTH_PERIOD_D) + omega*day_
-        return np.array([r*math.cos(th), r*math.sin(th), 0.0], dtype=float)
-
-    sun = np.array([0.0,0.0,0.0])
-    earth = planet(day, EARTH_AU, EARTH_PERIOD_D, 0.0)
-    venus = planet(day, VENUS_AU, VENUS_PERIOD_D, 0.6)
-    sc = sc_pos(day)
-    return sun, earth, venus, sc
+    n = float(np.linalg.norm(v))
+    return v / (n + 1e-12)
 
 
-def get_geom_positions(day: float, total_days: float, eps_day: float = 1.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+# ----------------------------
+# ゲーム設定
+# ----------------------------
+@dataclass
+class DartsConfig:
+    # ターン数（固定：5ターン）
+    n_turns: int = 5
+
+    # 盤面スケール（0点になる半径）
+    score_radius_km: float = 60000.0
+
+    # 金星の大きさ（円の表示用：半径[km]）
+    venus_radius_km: float = 6052.0
+
+    # 1ターンで動く“基本量”（強さが最大のときの平均移動量）
+    step_km: float = 12000.0
+
+    # 「ゆっくりしたクセ（風）」：ゲーム中は一定のズレとして入る（見える化する）
+    wind_km: float = 1200.0  # 大きいほど“癖”が強い
+
+    # 「ばらつき」：毎ターンのランダム（予測丸の半径に対応）
+    noise_sigma_km: float = 1800.0
+
+    # 目標点（ダーツの中心）
+    target_bt_br_km: Tuple[float, float] = (25000.0, -12000.0)
+
+
+CFG = DartsConfig()
+
+
+# ----------------------------
+# 物理っぽい（でもゲーム優先）モデル
+# ----------------------------
+def eff_from_alpha_deg(alpha_deg: float) -> float:
     """
-    幾何計算用の位置。
-    day=0 付近は IKAROS と地球が同じ場所になって、地球方向ベクトルが 0 になりがちです。
-    そのときは、少しだけ未来（day+eps_day）で計算した位置を使います。
+    α（アルファ）：太陽にどれくらい正面？
+    - 0°：まっすぐ（強い）
+    - 大きい：傾く（弱い）
+    ゲーム用の簡単モデル：効き = cos^2(alpha)
     """
-    sun, earth, venus, sc = get_positions_3d(day, total_days)
-    if norm(earth - sc) < 1e-8:
-        d2 = min(day + eps_day, total_days)
-        sun, earth, venus, sc = get_positions_3d(d2, total_days)
-    return sun, earth, venus, sc
+    a = math.radians(clamp(alpha_deg, 0.0, 75.0))
+    return float(math.cos(a) ** 2)
 
-def power_percent_from_vectors(sail_n: np.ndarray, sun_dir: np.ndarray) -> float:
-    """ベクトルから発電量（模型）。太陽方向に向いているほど大きい。"""
-    return float(max(0.0, float(np.dot(unit(sail_n), unit(sun_dir)))) * 100.0)
 
-def get_sensitivity(turn: int) -> np.ndarray:
-    if sens_available():
-        for d in SENS_DATA:
-            if isinstance(d, dict) and int(d.get("turn", -1)) == int(turn):
-                C = d.get("C", None)
-                try:
-                    M = np.array(C, dtype=float)
-                    if M.shape == (2,2):
-                        return M
-                except Exception:
-                    pass
-    gain = 8.0 + 0.9*turn
-    return gain*np.array([[1.0,0.3],[-0.2,0.9]], dtype=float)
+def mean_delta_km(alpha_deg: float, beta_deg: float, step_km: float) -> np.ndarray:
+    e = eff_from_alpha_deg(alpha_deg)
+    b = math.radians(beta_deg)
+    dir2 = np.array([math.cos(b), math.sin(b)], dtype=float)
+    return (step_km * e) * dir2
 
-# -----------------------------
-# 幾何（通信・でんき）
-# -----------------------------
-def in_blackout(day: float) -> bool:
-    return CFG.blackout_start_day <= day <= CFG.blackout_end_day
 
-def beta_to_tilt(beta_in: float, beta_out: float) -> float:
-    return float(math.sqrt(beta_in**2 + beta_out**2))
+def score_from_distance(d_km: float, R_km: float) -> int:
+    """
+    目標からの距離で点数（0〜100）
+    - d=0 なら 100点
+    - d>=R なら 0点
+    """
+    s = 100.0 * max(0.0, 1.0 - d_km / (R_km + 1e-12))
+    return int(round(s))
 
-def power_percent(tilt_deg: float) -> float:
-    return float(max(0.0, math.cos(math.radians(tilt_deg))) * 100.0)
 
-def comm_ok(earth_aspect_deg: float) -> bool:
-    return (earth_aspect_deg <= CFG.comm_ok_low_deg) or (earth_aspect_deg >= CFG.comm_ok_high_deg)
-
-def make_local_frame(sc: np.ndarray, sun: np.ndarray, earth: np.ndarray) -> Tuple[np.ndarray,np.ndarray,np.ndarray]:
-    z = unit(sun - sc)        # SC→Sun
-    e = unit(earth - sc)      # SC→Earth
-    x_raw = e - np.dot(e, z)*z
-    if norm(x_raw) < 1e-6:
-        tmp = np.array([1.0,0.0,0.0])
-        if abs(np.dot(tmp,z)) > 0.9:
-            tmp = np.array([0.0,1.0,0.0])
-        x_raw = tmp - np.dot(tmp,z)*z
-    x = unit(x_raw)
-    y = unit(np.cross(z, x))
-    return x, y, z
-
-def sail_normal(sc: np.ndarray, sun: np.ndarray, earth: np.ndarray, beta_in: float, beta_out: float) -> np.ndarray:
-    x,y,z = make_local_frame(sc, sun, earth)
-    tilt = beta_to_tilt(beta_in, beta_out)
-    n_local = np.array([math.sin(math.radians(beta_in)),
-                        math.sin(math.radians(beta_out)),
-                        math.cos(math.radians(tilt))], dtype=float)
-    n_local = unit(n_local)
-    return unit(n_local[0]*x + n_local[1]*y + n_local[2]*z)
-
-def earth_aspect(sc: np.ndarray, sun: np.ndarray, earth: np.ndarray, beta_in: float, beta_out: float) -> float:
-    x,y,z = make_local_frame(sc, sun, earth)
-    n = sail_normal(sc, sun, earth, beta_in, beta_out)
-    e = unit(earth - sc)
-    nL = np.array([np.dot(n,x), np.dot(n,y), np.dot(n,z)])
-    eL = np.array([np.dot(e,x), np.dot(e,y), np.dot(e,z)])
-    return angle_deg(nL, eL)
-
-def alpha_deg(sc: np.ndarray, sun: np.ndarray, earth: np.ndarray) -> float:
-    return angle_deg(sun-sc, earth-sc)
-
-# -----------------------------
-# 予測楕円（モンテカルロ）
-# -----------------------------
-def predict_next(x_hat: np.ndarray, C: np.ndarray, u: np.ndarray, k_hat: float, q: float, n: int) -> Tuple[np.ndarray,np.ndarray]:
-    rng = np.random.default_rng(12345 + int(10*abs(u[0])+7*abs(u[1])))
-    k = np.clip(rng.normal(k_hat, 0.15, size=n), 0.2, 2.0)
-    w = rng.normal(0.0, q, size=(n,2))
-    du = (k[:,None]*(C@u)[None,:])
-    samples = x_hat[None,:] + du + w
-    return samples.mean(axis=0), np.cov(samples.T)
-
-def ellipse(mu: np.ndarray, cov: np.ndarray, nsig: float, N: int=200) -> np.ndarray:
-    vals, vecs = np.linalg.eigh(cov)
-    vals = np.maximum(vals, 1e-9)
-    order = np.argsort(vals)[::-1]
-    vals, vecs = vals[order], vecs[:,order]
-    t = np.linspace(0,2*np.pi,N)
-    circle = np.vstack([np.cos(t), np.sin(t)])
-    pts = (vecs @ (nsig*np.sqrt(vals)[:,None]*circle)).T + mu[None,:]
-    return pts
-
-# -----------------------------
+# ----------------------------
 # セッション状態
-# -----------------------------
-def init_state(seed: int=2):
+# ----------------------------
+def init_state(seed: int = 1) -> None:
     rng = np.random.default_rng(seed)
+
     st.session_state.turn = 0
-    st.session_state.day = 0.0
-    st.session_state.rng_seed = int(seed)
+    st.session_state.pos = np.array([0.0, 0.0], dtype=float)  # 現在位置（BT,BR）
+    st.session_state.history = [st.session_state.pos.copy()]
 
-    st.session_state.x_true = np.array([CFG.init_bt_br_km[0], CFG.init_bt_br_km[1]], dtype=float)
-    st.session_state.x_hat = st.session_state.x_true + rng.normal(0.0, CFG.init_est_noise_km, size=2)
+    # 風（ゲーム中は固定）
+    ang = rng.uniform(0.0, 2 * math.pi)
+    st.session_state.wind = CFG.wind_km * np.array([math.cos(ang), math.sin(ang)], dtype=float)
 
-    st.session_state.k_true = float(rng.uniform(0.75, 1.25))
-    st.session_state.k_hat = 1.0
-
-    # β=0でも少しずつズレる（本当の宇宙っぽさ）
-    st.session_state.drift = rng.normal(0.0, CFG.drift_per_turn_km, size=(CFG.n_turns, 2))
-
-    st.session_state.log: List[Dict[str, object]] = []
-
-if "turn" not in st.session_state:
-    init_state()
-
-# -----------------------------
-# UI
-# -----------------------------
-st.set_page_config(page_title="IKAROS-GO", layout="wide")
-st.title("IKAROS-GO（試作）— IKAROSみたいに“ねらって”うごかすゲーム")
-
-total_days = CFG.n_turns*CFG.turn_days
-sun, earth, venus, sc = get_positions_3d(st.session_state.day, total_days)
-# 幾何は“安全版”で計算（初期に地球方向が0にならないように）
-sun_g, earth_g, venus_g, sc_g = get_geom_positions(st.session_state.day, total_days)
-alpha_now = alpha_deg(sc_g, sun_g, earth_g)
-
-with st.sidebar:
-    st.header("そうさ")
-    st.caption(f"Build: {APP_BUILD}")
-    st.caption("データが無ければ模型で動きます。データがあれば本物寄りに動きます。")
-    st.write(f"- mission_config.json: {'ある ✅' if isinstance(MISSION, dict) else 'ない'}")
-    st.write(f"- orbit_schedule.json: {'ある ✅' if orbit_available() else 'ない'}")
-    st.write(f"- sensitivity_schedule.json: {'ある ✅' if sens_available() else 'ない'}")
-
-    st.markdown("---")
-    seed = st.number_input("ランダムのタネ（seed）", 0, 9999, int(st.session_state.rng_seed), 1)
-    if st.button("さいしょからやり直す"):
-        init_state(int(seed))
-        st.rerun()
-
-    st.markdown("---")
-    beta_in = st.slider("β_in（左右）[deg]", -CFG.beta_max_deg, CFG.beta_max_deg, 0.0, CFG.beta_step_deg)
-    beta_out = st.slider("β_out（上下）[deg]", -CFG.beta_max_deg, CFG.beta_max_deg, 0.0, CFG.beta_step_deg)
-    n_samples = st.slider("よそうの点の数", 200, 3000, 900, 100)
-    vec_scale = st.slider("3Dベクトルの長さ（見やすさ）", 0.02, 0.40, 0.12, 0.01)
-
-    st.markdown("---")
-    step_btn = st.button("つぎの2週間へ（すすめる）", type="primary", disabled=(st.session_state.turn >= CFG.n_turns))
-
-# 状態表示
-progress = min(1.0, st.session_state.turn/CFG.n_turns)
-st.caption("進みぐあい（0% → 100%）")
-st.progress(progress)
-
-tilt = beta_to_tilt(beta_in, beta_out)
-# ベクトルから「でんき」と「通信」を計算
-sun_dir = unit(sun_g - sc_g)
-earth_dir = unit(earth_g - sc_g)
-sail_n_now = sail_normal(sc_g, sun_g, earth_g, beta_in, beta_out)
-
-# でんき（太陽方向に近いほど大きい）
-pwr = power_percent_from_vectors(sail_n_now, sun_dir)
-
-# 通信（帆面法線＝アンテナの向き、という模型）
-ea = angle_deg(sail_n_now, earth_dir)
-
-# でんき制限は、太陽方向との角度でチェック
-sun_aspect = angle_deg(sail_n_now, sun_dir)
-comm_success = (not in_blackout(st.session_state.day)) and (sun_aspect <= CFG.sun_tilt_limit_deg) and comm_ok(ea)
-
-c1,c2,c3,c4 = st.columns(4)
-c1.metric("いまのターン", f"{st.session_state.turn+1}/{CFG.n_turns}")
-c2.metric("地球と太陽の角度 α", f"{alpha_now:.1f}°")
-c3.metric("発電（模型）", f"{pwr:.0f}%")
-c4.metric("通信", "できた ✅" if comm_success else "できない ❌")
-
-if in_blackout(st.session_state.day):
-    st.warning("いまはブラックアウト中：なにをしても通信できません（演出）")
-
-# すすめる
-if step_btn:
-    rng = np.random.default_rng(int(st.session_state.rng_seed) + 1000 + int(st.session_state.turn))
-    u = np.array([beta_in, beta_out], dtype=float)
-
-    C = get_sensitivity(int(st.session_state.turn))
-    C_true = float(st.session_state.k_true) * C
-
-    w = rng.normal(0.0, CFG.process_noise_km, size=2)
-    drift = np.array(st.session_state.drift[int(st.session_state.turn)], dtype=float)
-    st.session_state.x_true = st.session_state.x_true + drift + C_true @ u + w
-
-    if comm_success:
-        meas = st.session_state.x_true + rng.normal(0.0, CFG.meas_noise_km, size=2)
-        st.session_state.x_hat = 0.6*st.session_state.x_hat + 0.4*meas
-        st.session_state.k_hat += 0.15*(float(st.session_state.k_true) - float(st.session_state.k_hat))
-
-    st.session_state.log.append({
-        "turn": int(st.session_state.turn),
-        "day": float(st.session_state.day),
-        "beta_in": float(beta_in),
-        "beta_out": float(beta_out),
-        "BT_hat": float(st.session_state.x_hat[0]),
-        "BR_hat": float(st.session_state.x_hat[1]),
-        "alpha_deg": float(alpha_now),
-        "tilt_deg": float(tilt),
-        "power_%": float(pwr),
-        "earth_aspect_deg": float(ea),
-        "comm": bool(comm_success),
-        "blackout": bool(in_blackout(st.session_state.day)),
-        "k_hat": float(st.session_state.k_hat),
-        "drift_BT": float(drift[0]),
-        "drift_BR": float(drift[1]),
-    })
-
-    st.session_state.turn += 1
-    st.session_state.day += float(CFG.turn_days)
-    if st.session_state.turn >= CFG.n_turns:
-        st.success("ミッションおわり！（試作）")
-    st.rerun()
-
-# -----------------------------
-# タブ
-# -----------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["B-plane（ねらい）","太陽系の図（2D）","βマップ","3次元可視化"])
-
-with tab1:
-    st.subheader("B-plane（ねらいの平面）")
+    # ログ
+    st.session_state.log: List[Dict[str, float]] = []
 
 
-    x_hat = np.array(st.session_state.x_hat, dtype=float)
-    u = np.array([beta_in, beta_out], dtype=float)
-    C = get_sensitivity(int(st.session_state.turn)) if st.session_state.turn < CFG.n_turns else np.eye(2)
+# ----------------------------
+# ダーツ盤（B-plane）描画
+# ----------------------------
+def add_filled_ring(fig: go.Figure, center: np.ndarray, r_in: float, r_out: float, name: str) -> None:
+    """
+    塗りつぶしリング（ドーナツ状）。
+    外周と内周をつないだ多角形で描いて、fill="toself" で塗ります。
+    """
+    th = np.linspace(0.0, 2 * math.pi, 240)
+    outer = np.c_[center[0] + r_out * np.cos(th), center[1] + r_out * np.sin(th)]
+    inner = np.c_[center[0] + r_in * np.cos(th[::-1]), center[1] + r_in * np.sin(th[::-1])]
+    poly = np.vstack([outer, inner, outer[:1]])
+    fig.add_trace(go.Scatter(
+        x=poly[:, 0], y=poly[:, 1],
+        mode="lines",
+        fill="toself",
+        name=name,
+        line=dict(width=1),
+        opacity=0.18,
+        showlegend=False,
+    ))
 
-    mu, cov = predict_next(x_hat, C, u, float(st.session_state.k_hat), CFG.process_noise_km, int(n_samples))
-    e1 = ellipse(mu, cov, 1.0)
-    e2 = ellipse(mu, cov, 2.0)
 
-    target = np.array(CFG.target_bt_br_km, dtype=float)
-    tol = float(CFG.tolerance_km)
-
-    # スコア（近いほど高い）
-    x_hat_ss = np.array(st.session_state.x_hat, dtype=float)
-    dist_km = float(np.linalg.norm(x_hat_ss - target))
-    score_radius = 4.0 * float(CFG.tolerance_km)
-    score = int(max(0.0, round(100.0 * (1.0 - dist_km / (score_radius + 1e-12)))))
-    st.metric("スコア", f"{score}点")
-
+def build_darts_figure(
+    pos: np.ndarray,
+    target: np.ndarray,
+    score_R: float,
+    venus_R: float,
+    pred_mean: np.ndarray,
+    pred_sigma: float,
+    wind: np.ndarray,
+    history: np.ndarray,
+) -> go.Figure:
     fig = go.Figure()
 
-    # 金星の位置（この簡易モデルではB-planeの原点が金星だと思ってOK）
-    fig.add_trace(go.Scatter(x=[0.0], y=[0.0], mode="markers", name="金星（基準点）"))
+    # ダーツ盤（塗りリング）
+    rings = [
+        (0.00, 0.15, "100点くらい"),
+        (0.15, 0.30, "80点くらい"),
+        (0.30, 0.50, "60点くらい"),
+        (0.50, 0.75, "40点くらい"),
+        (0.75, 1.00, "20点くらい"),
+    ]
+    for a, b, name in rings:
+        add_filled_ring(fig, target, a * score_R, b * score_R, name)
+
+    # 金星の大きさ（スケール感）
+    th = np.linspace(0.0, 2 * math.pi, 240)
+    fig.add_trace(go.Scatter(
+        x=0.0 + venus_R * np.cos(th),
+        y=0.0 + venus_R * np.sin(th),
+        mode="lines",
+        name="金星の大きさ（半径）",
+        line=dict(width=2),
+    ))
 
     # 目標点
-    fig.add_trace(go.Scatter(x=[float(target[0])], y=[float(target[1])], mode="markers", name="目標"))
+    fig.add_trace(go.Scatter(
+        x=[target[0]], y=[target[1]],
+        mode="markers+text",
+        name="目標（中心）",
+        text=["★"],
+        textposition="top center",
+    ))
 
-    th = np.linspace(0,2*np.pi,240)
-    fig.add_trace(go.Scatter(x=target[0]+tol*np.cos(th), y=target[1]+tol*np.sin(th), mode="lines", name="許容誤差（半径）"))
+    # 履歴（点の列）
+    fig.add_trace(go.Scatter(
+        x=history[:, 0], y=history[:, 1],
+        mode="markers",
+        name="これまで",
+    ))
 
-    # ダーツみたいに、同心円をいくつか出す（近いほど高得点）
-    ring_r = [tol*0.25, tol*0.5, tol*1.0, tol*2.0, tol*4.0]
-    ring_name = ["100点", "80点", "60点", "30点", "10点"]
-    for rr, nn in zip(ring_r, ring_name):
-        fig.add_trace(go.Scatter(
-            x=target[0] + rr*np.cos(th),
-            y=target[1] + rr*np.sin(th),
-            mode="lines",
-            name=f"点数目安：{nn}"
-        ))
+    # 現在位置
+    fig.add_trace(go.Scatter(
+        x=[pos[0]], y=[pos[1]],
+        mode="markers",
+        name="いまの位置",
+    ))
 
+    # 予測矢印（平均）
+    p2 = pos + pred_mean
+    fig.add_trace(go.Scatter(
+        x=[pos[0], p2[0]], y=[pos[1], p2[1]],
+        mode="lines+markers",
+        name="予測：このへんに行く（平均）",
+    ))
 
-    if st.session_state.log:
-        xs = [d["BT_hat"] for d in st.session_state.log]
-        ys = [d["BR_hat"] for d in st.session_state.log]
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="これまで"))
+    # 予測の丸（ばらつき）
+    r = float(pred_sigma)
+    fig.add_trace(go.Scatter(
+        x=p2[0] + r * np.cos(th),
+        y=p2[1] + r * np.sin(th),
+        mode="lines",
+        name="予測：ばらつき（目安）",
+        line=dict(width=1, dash="dot"),
+    ))
 
-    fig.add_trace(go.Scatter(x=[x_hat[0]], y=[x_hat[1]], mode="markers", name="いま（よそう）"))
-    fig.add_trace(go.Scatter(x=[float(mu[0])], y=[float(mu[1])], mode="markers", name="つぎ（まんなか）"))
-    fig.add_trace(go.Scatter(x=e2[:,0], y=e2[:,1], mode="lines", name="つぎのよそう（2σ）", fill="toself", opacity=0.15))
-    fig.add_trace(go.Scatter(x=e1[:,0], y=e1[:,1], mode="lines", name="つぎのよそう（1σ）", fill="toself", opacity=0.25))
+    # 風（クセ）表示：盤面の端に矢印
+    anchor = target + np.array([-0.92 * score_R, -0.92 * score_R], dtype=float)
+    wind_tip = anchor + 3.0 * unit(wind) * (0.08 * score_R)
+    fig.add_trace(go.Scatter(
+        x=[anchor[0], wind_tip[0]], y=[anchor[1], wind_tip[1]],
+        mode="lines+markers",
+        name="今日の宇宙のクセ（風）",
+    ))
 
-    fig.update_layout(xaxis_title="B_T (km)", yaxis_title="B_R (km)", height=600, margin=dict(l=10,r=10,t=10,b=10), showlegend=True)
-    fig.update_yaxes(scaleanchor="x", scaleratio=1)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("ログ")
-    st.dataframe(st.session_state.log, use_container_width=True)
-
-with tab2:
-    st.subheader("太陽・地球・金星・IKAROS（2D図）")
-    days = np.linspace(0, total_days, 260)
-    sc_p, e_p, v_p = [], [], []
-    for d in days:
-        s,e,v,k = get_positions_3d(float(d), total_days)
-        sc_p.append(k[:2]); e_p.append(e[:2]); v_p.append(v[:2])
-    sc_p = np.vstack(sc_p); e_p = np.vstack(e_p); v_p = np.vstack(v_p)
-
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=e_p[:,0], y=e_p[:,1], mode="lines", name="地球の道"))
-    fig2.add_trace(go.Scatter(x=v_p[:,0], y=v_p[:,1], mode="lines", name="金星の道"))
-    fig2.add_trace(go.Scatter(x=sc_p[:,0], y=sc_p[:,1], mode="lines", name="IKAROSの道"))
-    fig2.add_trace(go.Scatter(x=[0], y=[0], mode="markers", name="太陽"))
-    fig2.add_trace(go.Scatter(x=[earth[0]], y=[earth[1]], mode="markers", name="地球"))
-    fig2.add_trace(go.Scatter(x=[venus[0]], y=[venus[1]], mode="markers", name="金星"))
-    fig2.add_trace(go.Scatter(x=[sc[0]], y=[sc[1]], mode="markers", name="IKAROS（いま）"))
-    fig2.update_layout(xaxis_title="x", yaxis_title="y", height=640, margin=dict(l=10,r=10,t=10,b=10), showlegend=True)
-    fig2.update_yaxes(scaleanchor="x", scaleratio=1)
-    st.plotly_chart(fig2, use_container_width=True)
-
-    st.write(f"- きょうは **{st.session_state.day:.0f}日目**\n- 進みぐあいは **{progress*100:.0f}%**\n- 地球と太陽の角度 α は **{alpha_now:.1f}°**")
-
-with tab3:
-    st.subheader("βマップ（通信とでんき）")
-    grid_step = 1.0
-    xs = np.arange(-CFG.beta_max_deg, CFG.beta_max_deg + 1e-9, grid_step)
-    ys = np.arange(-CFG.beta_max_deg, CFG.beta_max_deg + 1e-9, grid_step)
-    P = np.zeros((len(ys), len(xs)), dtype=float)
-    COMM = np.zeros((len(ys), len(xs)), dtype=float)
-    COMM_Q = np.zeros((len(ys), len(xs)), dtype=float)  # 通信の“強さ”(0-100)
-
-    if in_blackout(st.session_state.day):
-        st.warning("通信できない時間帯（ブラックアウト）です。βマップでは通信を0にします。")
-
-    # “ベクトル”から判定するβマップ（3Dタブと同じ考え方）
-    sun_dir = unit(sun_g - sc_g)
-    earth_dir = unit(earth_g - sc_g)
-
-    for j, bo in enumerate(ys):
-        for i, bi in enumerate(xs):
-            n = sail_normal(sc_g, sun_g, earth_g, float(bi), float(bo))
-
-            # でんき（太陽方向に近いほど大きい）
-            P[j, i] = power_percent_from_vectors(n, sun_dir)
-
-            if in_blackout(st.session_state.day):
-                COMM[j, i] = 0.0
-                COMM_Q[j, i] = 0.0
-            else:
-                earth_aspect_deg_ = angle_deg(n, earth_dir)
-                sun_aspect_deg_ = angle_deg(n, sun_dir)
-                ok = (sun_aspect_deg_ <= CFG.sun_tilt_limit_deg) and comm_ok(earth_aspect_deg_)
-                COMM[j, i] = 1.0 if ok else 0.0
-
-                # 通信の“強さ”(0-100)：地球方向がコーン中心に近いほど強い
-                cos60 = math.cos(math.radians(CFG.comm_ok_low_deg))
-                ea = float(earth_aspect_deg_)
-                # 近い側（0〜60度）
-                q1 = (math.cos(math.radians(ea)) - cos60) / (1.0 - cos60)
-                # 反対側（120〜180度）
-                ea2 = abs(180.0 - ea)
-                q2 = (math.cos(math.radians(ea2)) - cos60) / (1.0 - cos60)
-                q = max(0.0, min(1.0, max(q1, q2)))
-                COMM_Q[j, i] = 100.0*q if (sun_aspect_deg_ <= CFG.sun_tilt_limit_deg) else 0.0
-
-    fig3 = go.Figure()
-    fig3.add_trace(go.Heatmap(x=xs, y=ys, z=P, colorbar=dict(title="でんき(%)")))
-    fig3.add_trace(go.Contour(x=xs, y=ys, z=COMM, showscale=False, contours=dict(start=0.5,end=0.5,size=1), name="通信OKの線", line=dict(width=3)))
-    th = np.linspace(0,2*np.pi,240)
-    r = CFG.sun_tilt_limit_deg
-    fig3.add_trace(go.Scatter(x=r*np.cos(th), y=r*np.sin(th), mode="lines", name=f"でんき制限 {r:.0f}°"))
-    fig3.add_trace(go.Scatter(x=[beta_in], y=[beta_out], mode="markers", name="いまのβ"))
-    fig3.update_layout(xaxis_title="β_in (deg)", yaxis_title="β_out (deg)", height=650, margin=dict(l=10,r=10,t=10,b=10), showlegend=True)
-    fig3.update_yaxes(scaleanchor="x", scaleratio=1)
-    st.plotly_chart(fig3, use_container_width=True)
-    st.markdown("#### 通信のβマップ（強さ）")
-    fig3b = go.Figure()
-    fig3b.add_trace(go.Heatmap(x=xs, y=ys, z=COMM_Q, colorbar=dict(title="通信(0-100)")))
-    fig3b.add_trace(go.Scatter(x=[beta_in], y=[beta_out], mode="markers", name="いまのβ"))
-    fig3b.update_layout(xaxis_title="β_in (deg)", yaxis_title="β_out (deg)", height=650, margin=dict(l=10,r=10,t=10,b=10))
-    fig3b.update_yaxes(scaleanchor="x", scaleratio=1)
-    st.plotly_chart(fig3b, use_container_width=True)
-
-
-    st.write(f"- 太陽からのかたむき: **{tilt:.1f}°**\n- でんき: **{pwr:.0f}%**\n- 地球に向けた角度: **{ea:.1f}°**\n- 通信: **{'できる' if comm_success else 'できない'}**")
-
-with tab4:
-    st.subheader("3次元可視化（通信コーン + 太陽/地球ベクトル + 帆の平面）")
-    st.caption("軌道は描きません。IKAROSのまわりだけを、立体で見ます。")
-
-    # いまのベクトル（IKAROSから見た向き）
-    sun_dir = unit(sun_g - sc_g)      # IKAROS→太陽
-    earth_dir = unit(earth_g - sc_g)  # IKAROS→地球
-    sail_n = sail_normal(sc_g, sun_g, earth_g, beta_in, beta_out)  # 帆面法線（β）
-
-    # 表示スケール（見やすさ）
-    L = float(vec_scale)          # ベクトル長
-    Lc = float(vec_scale) * 1.6   # コーンの長さ
-    plane_size = float(vec_scale) * 0.9
-
-    # ローカル座標：IKAROSを原点にする
-    O = np.array([0.0, 0.0, 0.0], dtype=float)
-
-    def vec_trace(name: str, v: np.ndarray):
-        p1 = O + L * v
-        return go.Scatter3d(
-            x=[O[0], p1[0]], y=[O[1], p1[1]], z=[O[2], p1[2]],
-            mode="lines+markers", name=name
-        )
-
-    def orthonormal_basis(axis: np.ndarray):
-        axis = unit(axis)
-        tmp = np.array([1.0, 0.0, 0.0], dtype=float)
-        if abs(np.dot(tmp, axis)) > 0.9:
-            tmp = np.array([0.0, 1.0, 0.0], dtype=float)
-        u = tmp - np.dot(tmp, axis) * axis
-        u = unit(u)
-        v = unit(np.cross(axis, u))
-        return u, v
-
-    def cone_surface(axis: np.ndarray, half_angle_deg: float, length: float, n_phi: int = 80, n_r: int = 20):
-        """原点から伸びるコーン面（x,y,z の2D配列）"""
-        axis = unit(axis)
-        u, v = orthonormal_basis(axis)
-        theta = math.radians(half_angle_deg)
-
-        phis = np.linspace(0.0, 2*math.pi, n_phi)
-        rs = np.linspace(0.0, length, n_r)
-
-        X = np.zeros((n_r, n_phi), dtype=float)
-        Y = np.zeros((n_r, n_phi), dtype=float)
-        Z = np.zeros((n_r, n_phi), dtype=float)
-
-        for i, r_ in enumerate(rs):
-            for j, phi in enumerate(phis):
-                dir_ = math.cos(theta) * axis + math.sin(theta) * (math.cos(phi) * u + math.sin(phi) * v)
-                p = r_ * dir_
-                X[i, j], Y[i, j], Z[i, j] = float(p[0]), float(p[1]), float(p[2])
-        return X, Y, Z
-
-    def sail_plane_trace(n_hat: np.ndarray, size: float):
-        """帆の平面（四角形）を線で表示"""
-        n_hat = unit(n_hat)
-        a, b = orthonormal_basis(n_hat)  # a,b は平面内
-        p1 = O + size*(+a + b)
-        p2 = O + size*(+a - b)
-        p3 = O + size*(-a - b)
-        p4 = O + size*(-a + b)
-        xs = [p1[0], p2[0], p3[0], p4[0], p1[0]]
-        ys = [p1[1], p2[1], p3[1], p4[1], p1[1]]
-        zs = [p1[2], p2[2], p3[2], p4[2], p1[2]]
-        return go.Scatter3d(x=xs, y=ys, z=zs, mode="lines", name="帆の平面（イメージ）")
-
-    # 通信可能コーン：地球方向に対して 0〜60° または 120〜180°（= 反対向きから60°以内）
-    # → 地球方向のコーン（半角60°）と、反対向きのコーン（半角60°）を描く
-    X1, Y1, Z1 = cone_surface(sail_n, CFG.comm_ok_low_deg, Lc)
-    X2, Y2, Z2 = cone_surface(-sail_n, CFG.comm_ok_low_deg, Lc)
-
-    fig4 = go.Figure()
-    fig4.add_trace(vec_trace("太陽方向（IKAROS→太陽）", sun_dir))
-    fig4.add_trace(vec_trace("地球方向（IKAROS→地球）", earth_dir))
-    fig4.add_trace(vec_trace("帆面法線（β）", sail_n))
-    fig4.add_trace(sail_plane_trace(sail_n, plane_size))
-
-    fig4.add_trace(go.Surface(x=X1, y=Y1, z=Z1, name="通信できるコーン（地球向き）", opacity=0.18, showscale=False))
-    fig4.add_trace(go.Surface(x=X2, y=Y2, z=Z2, name="通信できるコーン（反対向き）", opacity=0.18, showscale=False))
-
-    fig4.update_layout(
-        scene=dict(xaxis_title="x", yaxis_title="y", zaxis_title="z", aspectmode="data"),
+    # 体裁
+    lim = score_R * 1.05
+    fig.update_layout(
+        xaxis_title="BT [km]",
+        yaxis_title="BR [km]",
         height=720,
         margin=dict(l=10, r=10, t=10, b=10),
-        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
     )
-    st.plotly_chart(fig4, use_container_width=True)
+    fig.update_xaxes(range=[target[0] - lim, target[0] + lim], zeroline=False)
+    fig.update_yaxes(range=[target[1] - lim, target[1] + lim], zeroline=False, scaleanchor="x", scaleratio=1)
+    return fig
 
-    st.markdown("### かんたん説明")
-    st.write(
-        "- **通信コーン**は、帆の法線（アンテナの向き）に固定されています。\n"
-        "  地球方向ベクトルがコーンの中に入ると通信しやすい（このゲームのルール）\n"
-        "- **太陽方向**に近いほど、でんき（発電）が増える\n"
-        "- **帆の平面**は「向きのイメージ」です（四角い板だと思ってOK）"
+
+# ----------------------------
+# UI
+# ----------------------------
+st.set_page_config(page_title="IKAROS-GO! (Darts)", layout="wide")
+
+st.title("IKAROS-GO!：膜（帆）の向きで、ダーツを当てよう！")
+st.caption(f"Build: {APP_BUILD}")
+
+with st.sidebar:
+    st.header("ゲーム")
+    st.write("**5ターン**で終わります。最後に、目標に近いほど高得点！")
+
+    seed = st.number_input("ランダムのタネ（同じにすると同じ風になる）", min_value=0, max_value=9999, value=1, step=1)
+
+    if st.button("リセット（最初から）"):
+        init_state(int(seed))
+
+    st.divider()
+    st.header("操作（このターン）")
+    st.write("開き量は変えません（面積は固定）。**向き**だけ変えます。")
+
+    alpha = st.slider("α：太陽にどれくらい正面？（小さいほど強い）", 0.0, 60.0, 15.0, 0.5)
+    beta = st.slider("β：どっち方向に押す？（角度）", 0.0, 360.0, 0.0, 1.0)
+
+    st.divider()
+    st.header("あとで追加できる要素")
+    st.write("- 通信・発電のルール（難易度調整）\n- βマップ\n- 3D表示\n- 実データ生成ツール")
+
+
+# 初期化
+if "turn" not in st.session_state:
+    init_state(int(seed))
+
+turn = int(st.session_state.turn)
+pos = np.array(st.session_state.pos, dtype=float)
+target = np.array(CFG.target_bt_br_km, dtype=float)
+wind = np.array(st.session_state.wind, dtype=float)
+history = np.array(st.session_state.history, dtype=float)
+
+# 予測（平均とばらつき）
+pred_mean = mean_delta_km(alpha, beta, CFG.step_km) + wind
+pred_sigma = CFG.noise_sigma_km
+
+# 現在スコア（「いまの位置」から目標まで）
+d_now = float(np.linalg.norm(pos - target))
+score_now = score_from_distance(d_now, CFG.score_radius_km)
+
+# 上段メーター
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("ターン", f"{turn+1}/{CFG.n_turns}")
+c2.metric("いまの距離", f"{d_now:,.0f} km")
+c3.metric("いまの点数（目安）", f"{score_now} 点")
+c4.metric("効き（強さ）", f"{eff_from_alpha_deg(alpha)*100:.0f} %")
+
+
+left, right = st.columns([1.3, 0.7], gap="large")
+
+with left:
+    st.subheader("ダーツ盤（B-plane）")
+    fig = build_darts_figure(
+        pos=pos,
+        target=target,
+        score_R=CFG.score_radius_km,
+        venus_R=CFG.venus_radius_km,
+        pred_mean=pred_mean,
+        pred_sigma=pred_sigma,
+        wind=wind,
+        history=history,
     )
+    st.plotly_chart(fig, use_container_width=True)
+
+with right:
+    st.subheader("このターンにやること")
+    st.write("1) αとβを決める → 2) 『実行！』 → 点が動く")
+
+    eff = eff_from_alpha_deg(alpha)
+    st.write(f"- 今回の**強さ**（効き）：{eff*100:.0f}%")
+    st.write(f"- 予測の平均移動：BT {pred_mean[0]:+.0f} km, BR {pred_mean[1]:+.0f} km")
+    st.write(f"- ばらつき（目安）：±{pred_sigma:.0f} km")
+
+    can_step = turn < (CFG.n_turns - 1)
+    btn = st.button("実行！（このターンの操作を反映）", disabled=(not can_step))
+
+    if btn:
+        rng = np.random.default_rng(int(seed) + 1000 + turn)
+
+        # 実際の移動（平均＋ばらつき）
+        noise = rng.normal(0.0, CFG.noise_sigma_km, size=2)
+        delta = pred_mean + noise
+        pos2 = pos + delta
+
+        st.session_state.pos = pos2
+        st.session_state.turn = turn + 1
+        st.session_state.history.append(pos2.copy())
+        st.session_state.log.append({
+            "turn": float(turn + 1),
+            "alpha_deg": float(alpha),
+            "beta_deg": float(beta),
+            "eff": float(eff),
+            "dBT": float(delta[0]),
+            "dBR": float(delta[1]),
+            "noiseBT": float(noise[0]),
+            "noiseBR": float(noise[1]),
+        })
+
+        st.success("動かした！ 次のターンへ。")
+        st.rerun()
+
+    if turn == (CFG.n_turns - 1):
+        d_fin = float(np.linalg.norm(pos - target))
+        score_fin = score_from_distance(d_fin, CFG.score_radius_km)
+        st.divider()
+        st.subheader("結果！")
+        st.write(f"目標からの距離：**{d_fin:,.0f} km**")
+        st.write(f"スコア：**{score_fin} 点**")
+        st.write("また遊ぶなら、左の『リセット』を押してね。")
+
+    st.divider()
+    st.subheader("メモ（小学生向け）")
+    st.write(
+        "- **β（ベータ）**は『どっち方向に押す？』\n"
+        "- **α（アルファ）**は『太陽にどれくらい正面？（強さ）』\n"
+        "- 点は、毎回ちょっとだけズレるよ（宇宙はむずかしい！）"
+    )
+
+    with st.expander("大人向け：このゲームの中身（超ざっくり）"):
+        st.code(
+            "Δ = K·cos²(α)·[cosβ, sinβ] + wind + noise\n"
+            "score = 100·max(0, 1 - |pos-target|/R)",
+            language="text"
+        )
+
+with st.expander("ログ（デバッグ用）"):
+    if st.session_state.log:
+        st.json(st.session_state.log[-5:])
+    else:
+        st.write("まだログはありません。")
