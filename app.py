@@ -23,7 +23,7 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 
-APP_BUILD = "v8-darts-S-2026-02-13"
+APP_BUILD = "v9-darts-S-2026-02-14"
 
 
 # ----------------------------
@@ -310,6 +310,7 @@ with left:
 
 with right:
     st.subheader("このターンにやること")
+    st.info("進めるボタンは **左のサイドバー** にあります。")
     st.write("1) αとβを決める → 2) 『実行！』 → 点が動く")
 
     eff = eff_from_alpha_deg(alpha)
@@ -318,7 +319,7 @@ with right:
     st.write(f"- ばらつき（目安）：±{pred_sigma:.0f} km")
 
     can_step = turn < (CFG.n_turns - 1)
-    btn = st.button("実行！（このターンの操作を反映）", disabled=(not can_step))
+    btn = st.sidebar.button("実行！（このターンの操作を反映）", disabled=(not can_step))
 
     if btn:
         rng = np.random.default_rng(int(seed) + 1000 + turn)
