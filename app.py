@@ -20,7 +20,7 @@ import io
 import pathlib
 
 
-APP_BUILD = "v13.1-visual-physics-2026-02-14"
+APP_BUILD = "v13.2-3d-fix-2026-02-14"
 
 AU_KM = 149_597_870.7  # 1 AU in km
 DEFAULT_TEX_PATH = pathlib.Path(__file__).parent / "assets" / "ikaros_texture.png"
@@ -673,14 +673,14 @@ with tabs[3]:
     tex_img = None
     if up is not None:
         try:
-            tex_img = Image.open(io.BytesIO(up.read())).convert("L")  # グレースケール
+            tex_img = Image.open(io.BytesIO(up.read())).convert("RGB")  # カラー
         except Exception:
             tex_img = None
 
     # 画像をアップロードしなかった場合は、同梱のデフォルト画像を使う
     if tex_img is None and DEFAULT_TEX_PATH.exists():
         try:
-            tex_img = Image.open(DEFAULT_TEX_PATH).convert("L")
+            tex_img = Image.open(DEFAULT_TEX_PATH).convert("RGB")
         except Exception:
             tex_img = None
 
@@ -688,7 +688,7 @@ with tabs[3]:
 
     fig4 = go.Figure()
 
-    # ---- IKAROSの帆（平面）を3Dで表示 ----
+    # ---- IKAROSの帆（薄い板）を3Dで表示（カラー画像テクスチャ風） ----
     axis = unit(sail_n)
     a = np.array([0.0, 0.0, 1.0])
     b1 = np.cross(axis, a)
@@ -698,77 +698,98 @@ with tabs[3]:
     b1 = unit(b1)
     b2 = unit(np.cross(axis, b1))
 
-    sail_half = 0.75  # 表示サイズ（見た目用）
-    uu = np.linspace(-1.0, 1.0, 40)
-    vv = np.linspace(-1.0, 1.0, 40)
-    Xs = np.zeros((len(vv), len(uu)))
-    Ys = np.zeros((len(vv), len(uu)))
-    Zs = np.zeros((len(vv), len(uu)))
+    # 帆のサイズ（見た目用）
+    sail_half = 0.82
 
+    # メッシュ分割数（大きいほど綺麗だけど重い）
+    nu, nv = 36, 36
+    uu = np.linspace(-1.0, 1.0, nu)
+    vv = np.linspace(-1.0, 1.0, nv)
+
+    # 画像（カラー）をメッシュに合わせてリサイズ
     if tex_img is not None:
-        img2 = tex_img.resize((len(uu), len(vv)))
-        tex = np.array(img2, dtype=float) / 255.0
+        img2 = tex_img.resize((nu, nv))
+        tex = np.array(img2, dtype=np.uint8)  # (nv, nu, 3)
     else:
-        U, V = np.meshgrid(np.linspace(-1, 1, len(uu)), np.linspace(-1, 1, len(vv)))
-        tex = 0.25 + 0.75 * (np.exp(-((U*4)**2)) + np.exp(-((V*4)**2)))
-        tex = np.clip(tex, 0.0, 1.0)
+        # 画像が無いときは簡易模様（カラー）
+        U, V = np.meshgrid(np.linspace(-1, 1, nu), np.linspace(-1, 1, nv))
+        base = 180 + 60 * (np.exp(-((U*4)**2)) + np.exp(-((V*4)**2)))
+        base = np.clip(base, 0, 255).astype(np.uint8)
+        tex = np.stack([base, base, base], axis=-1)
 
+    # 頂点座標
+    Xv, Yv, Zv = [], [], []
+    colors = []
     for j, v in enumerate(vv):
         for i, u in enumerate(uu):
             p = sail_half * (u * b1 + v * b2)
-            Xs[j, i], Ys[j, i], Zs[j, i] = float(p[0]), float(p[1]), float(p[2])
+            Xv.append(float(p[0])); Yv.append(float(p[1])); Zv.append(float(p[2]))
+            r, g, b = tex[j, i, 0], tex[j, i, 1], tex[j, i, 2]
+            colors.append(f"rgb({int(r)},{int(g)},{int(b)})")
 
-    # 薄い直方体っぽくするため、表と裏の2枚を描きます（厚みは少しだけ）
-    thickness = 0.06  # 見た目用（小さいほど薄い）
-    Xt = Xs + (thickness / 2.0) * axis[0]
-    Yt = Ys + (thickness / 2.0) * axis[1]
-    Zt = Zs + (thickness / 2.0) * axis[2]
+    # 三角形分割（2枚/セル）
+    I, J, K = [], [], []
+    def vid(ii, jj): return jj * nu + ii
+    for jj in range(nv - 1):
+        for ii in range(nu - 1):
+            v00 = vid(ii, jj)
+            v10 = vid(ii + 1, jj)
+            v01 = vid(ii, jj + 1)
+            v11 = vid(ii + 1, jj + 1)
+            I += [v00, v10]
+            J += [v10, v11]
+            K += [v01, v01]
 
-    Xb = Xs - (thickness / 2.0) * axis[0]
-    Yb = Ys - (thickness / 2.0) * axis[1]
-    Zb = Zs - (thickness / 2.0) * axis[2]
-
-    fig4.add_trace(go.Surface(
-        x=Xt, y=Yt, z=Zt,
-        surfacecolor=tex,
-        colorscale="Gray",
-        showscale=False,
-        opacity=0.98,
-        name="IKAROS帆（表）",
+    fig4.add_trace(go.Mesh3d(
+        x=Xv, y=Yv, z=Zv,
+        i=I, j=J, k=K,
+        vertexcolor=colors,
+        name="IKAROS帆",
+        opacity=1.0,
         hoverinfo="skip",
     ))
 
-    fig4.add_trace(go.Surface(
-        x=Xb, y=Yb, z=Zb,
-        surfacecolor=tex,
-        colorscale="Gray",
-        showscale=False,
-        opacity=0.98,
-        name="IKAROS帆（裏）",
-        hoverinfo="skip",
-    ))
-
+    # 本体（小さい点）
     fig4.add_trace(go.Scatter3d(
         x=[0.0], y=[0.0], z=[0.0],
-        mode="markers+text",
+        mode="text",
         text=["IKAROS"],
         textposition="top center",
         name="本体",
-        marker=dict(size=5),
     ))
+
 
     def add_vec(v: np.ndarray, name: str):
         vv = unit(v)
+        # 線（マーカー無し）
         fig4.add_trace(go.Scatter3d(
             x=[0, vv[0]], y=[0, vv[1]], z=[0, vv[2]],
-            mode="lines+markers", name=name
+            mode="lines", name=name
+        ))
+        # 矢印の先端（Cone）
+        fig4.add_trace(go.Cone(
+            x=[0.0], y=[0.0], z=[0.0],
+            u=[vv[0]], v=[vv[1]], w=[vv[2]],
+            anchor="tail",
+            showscale=False,
+            sizemode="absolute",
+            sizeref=0.22,
+            name=name + "（矢印）",
+            showlegend=False,
+            hoverinfo="skip",
+            opacity=0.85,
         ))
 
     add_vec(sun_dir, "太陽方向")
     add_vec(earth_dir, "地球方向")
     add_vec(sail_n, "帆面法線（アンテナ向き）")
 
-    def cone_surface(axis: np.ndarray, half_deg: float, length: float, ntheta: int = 50, nphi: int = 40):
+    def cone_surface(axis: np.ndarray, half_deg: float, length: float, ntheta: int = 60, ns: int = 30):
+        """
+        コーン（側面）を作る：半球にならないように“側面だけ”描きます。
+        - half_deg：コーンの半角
+        - length：コーンの長さ
+        """
         axis = unit(axis)
         a = np.array([0.0, 0.0, 1.0])
         e1 = np.cross(axis, a)
@@ -779,15 +800,17 @@ with tabs[3]:
         e2 = unit(np.cross(axis, e1))
 
         th = np.linspace(0, 2 * math.pi, ntheta)
-        ph = np.linspace(0, math.radians(half_deg), nphi)
-        X = np.zeros((nphi, ntheta))
-        Y = np.zeros((nphi, ntheta))
-        Z = np.zeros((nphi, ntheta))
-        for i, p in enumerate(ph):
+        ss = np.linspace(0.0, float(length), ns)
+        p = math.radians(float(half_deg))
+
+        X = np.zeros((ns, ntheta))
+        Y = np.zeros((ns, ntheta))
+        Z = np.zeros((ns, ntheta))
+        for i, s in enumerate(ss):
             for j, t in enumerate(th):
                 d = (math.cos(p) * axis +
                      math.sin(p) * (math.cos(t) * e1 + math.sin(t) * e2))
-                d = unit(d) * length
+                d = unit(d) * s
                 X[i, j], Y[i, j], Z[i, j] = d[0], d[1], d[2]
         return X, Y, Z
 
@@ -815,7 +838,7 @@ with tabs[3]:
         "  地球方向ベクトルがコーンの中に入ると通信しやすい（このゲームのルール）\n"
         "- **太陽方向**に近いほど、発電が増える\n"
         "- ここでは軌道の線は描かず、“向き”だけを見ます\n"
-        "- 画像をアップロードすると、帆の見た目が画像っぽくなります（グレー表示）"
+        "- 画像をアップロードすると、帆の見た目が画像っぽくなります（カラー表示）"
     )
 
 with st.expander("ログ（確認用）"):
