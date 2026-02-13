@@ -16,7 +16,7 @@ import streamlit as st
 import plotly.graph_objects as go
 
 
-APP_BUILD = "v12-full-deterministic-2026-02-14"
+APP_BUILD = "v12.1-full-deterministic-2026-02-14"
 
 
 # -----------------------------
@@ -386,8 +386,20 @@ st.set_page_config(page_title="IKAROS-GO! (Full)", layout="wide")
 st.title("IKAROS-GO!（本格・決定論版）")
 st.caption(f"Build: {APP_BUILD} / 乱数なし（同じ操作→同じ結果）")
 
-if "turn" not in st.session_state:
-    init_state()
+# Streamlitは「アプリ更新後もセッションの中身が残る」ことがあります。
+# その場合、古い版の変数だけ残って新しい変数が無い → エラー、が起きがちです。
+# ここで「必要な変数が全部そろっているか」をチェックして、足りなければ初期化します。
+REQUIRED_KEYS = [
+    "turn", "day", "k_true", "k_hat",
+    "x_true", "x_hat", "history", "log",
+]
+
+def ensure_state() -> None:
+    missing = [k for k in REQUIRED_KEYS if k not in st.session_state]
+    if missing:
+        init_state()
+
+ensure_state()
 
 with st.sidebar:
     st.header("ゲーム")
@@ -414,7 +426,7 @@ with st.sidebar:
     st.write("このターンの C(k)（km/deg）")
     st.write(get_sensitivity(int(st.session_state.turn)))
 
-    st.write(f"k_true（本当）={st.session_state.k_true:.2f} / k_hat（想定）={st.session_state.k_hat:.2f}")
+    st.write(f"k_true（本当）={st.session_state['k_true']:.2f} / k_hat（想定）={st.session_state['k_hat']:.2f}")
     st.write("※通信できたら推定が一気に良くなる（模型）")
 
 
