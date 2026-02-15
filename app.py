@@ -20,7 +20,7 @@ import io
 import pathlib
 
 
-APP_BUILD = "v14.2-fix-play-2d-2026-02-14"
+APP_BUILD = "v14.3-fix-step-dist-2026-02-14"
 
 AU_KM = 149_597_870.7  # 1 AU in km
 DEFAULT_TEX_PATH = pathlib.Path(__file__).parent / "assets" / "ikaros_texture.png"
@@ -473,6 +473,9 @@ def step_once(beta_in: float, beta_out: float) -> None:
     if comm:
         st.session_state.x_hat = st.session_state.x_true.copy()
 
+    # B-planeの目標からの距離（km）
+    target = np.array(C.target_bt_br_km, dtype=float)
+    d_km = float(np.linalg.norm(st.session_state.x_hat - target))
 
     st.session_state.log.append({
         "turn": float(turn + 1),
