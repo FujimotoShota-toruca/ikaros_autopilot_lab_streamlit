@@ -20,7 +20,7 @@ import io
 import pathlib
 
 
-APP_BUILD = "v14-results-physics-orbit-2026-02-14"
+APP_BUILD = "v14.1-results-bplane-sidebar-score-2026-02-14"
 
 AU_KM = 149_597_870.7  # 1 AU in km
 DEFAULT_TEX_PATH = pathlib.Path(__file__).parent / "assets" / "ikaros_texture.png"
@@ -431,13 +431,11 @@ def init_state() -> None:
 
     st.session_state.history = [st.session_state.x_hat.copy()]
     st.session_state.log: List[Dict[str, float]] = []
-    st.session_state.include_power = True
-    st.session_state.include_comm = True
     st.session_state.page = "play"
 
 def step_once(beta_in: float, beta_out: float) -> None:
     turn = int(st.session_state.turn)
-    if turn >= C.n_turns - 1:
+    if turn >= C.n_turns:
         return
 
     u = np.array([beta_in, beta_out], dtype=float)
@@ -475,15 +473,6 @@ def step_once(beta_in: float, beta_out: float) -> None:
     if comm:
         st.session_state.x_hat = st.session_state.x_true.copy()
 
-    # ダーツ点（距離）
-    d_km = float(np.linalg.norm(st.session_state.x_hat - np.array(C.target_bt_br_km, dtype=float)))
-    score_dist = float(score_from_distance(d_km))
-
-    # 発電・通信の点（おまけ）
-    # ※点数に入れる/入れないは、リザルト画面や表示で切り替えられるよう、成分として保存するだけにします。
-    score_pwr = float(round(20.0 * (pwr / 100.0)))   # 0〜20点
-    score_comm = float(20.0 if comm else 0.0)        # OKなら20点、NGなら0点
-
 
     st.session_state.log.append({
         "turn": float(turn + 1),
@@ -494,9 +483,6 @@ def step_once(beta_in: float, beta_out: float) -> None:
         "comm": float(1.0 if comm else 0.0),
         "comm_q": float(comm_q),
         "dist_km": float(d_km),
-        "score_dist": float(score_dist),
-        "score_pwr": float(score_pwr),
-        "score_comm": float(score_comm),
         "x_true_BT": float(st.session_state.x_true[0]),
         "x_true_BR": float(st.session_state.x_true[1]),
         "x_hat_BT": float(st.session_state.x_hat[0]),
@@ -507,11 +493,11 @@ def step_once(beta_in: float, beta_out: float) -> None:
 
     # 時間を進める
     st.session_state.turn = turn + 1
-    st.session_state.day = float(st.session_state.day) + C.total_days / (C.n_turns - 1)
+    st.session_state.day = float(st.session_state.day) + C.total_days / C.n_turns
 
     st.session_state.history.append(st.session_state.x_hat.copy())
 
-    if int(st.session_state.turn) >= (C.n_turns - 1):
+    if int(st.session_state.turn) >= C.n_turns:
         st.session_state.page = "result"
 
 
@@ -528,7 +514,7 @@ st.caption(f"Build: {APP_BUILD} / 乱数なし（同じ操作→同じ結果）"
 REQUIRED_KEYS = [
     "turn", "day", "k_true", "k_hat",
     "x_true", "x_hat", "history", "log",
-    "include_power", "include_comm", "page",
+    "page",
 ]
 
 def ensure_state() -> None:
@@ -538,36 +524,61 @@ def ensure_state() -> None:
 
 ensure_state()
 
-def compute_score_rows(log_rows: List[Dict[str, float]], include_power: bool, include_comm: bool) -> List[Dict[str, float]]:
-    out = []
-    total = 0.0
+def compute_score_rows(log_rows: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    """
+    点数を計算して、各ターンの「暫定スコア」を作る。
+    ルール（v14.1）
+    - 距離点：その時点のB-plane距離（近いほど高得点）
+    - 通信点：通信OKの回数 × 10点（累積）
+    - 発電点：発電%の合計を 10 で割って点にする（例：発電合計250% → 25点）
+    ※最終スコアは「最終ターンの距離」を使う（リザルトで表示）
+    """
+    out: List[Dict[str, float]] = []
+    comm_cnt = 0.0
+    pwr_sum = 0.0
     for r in log_rows:
-        sd = float(r.get("score_dist", 0.0))
-        sp = float(r.get("score_pwr", 0.0)) if include_power else 0.0
-        sc = float(r.get("score_comm", 0.0)) if include_comm else 0.0
-        sturn = sd + sp + sc
-        total += sturn
+        comm_cnt += float(r.get("comm", 0.0))
+        pwr_sum += float(r.get("pwr", 0.0))
+        dist_km = float(r.get("dist_km", 0.0))
+        score_dist = float(score_from_distance(dist_km))
+        score_comm = float(comm_cnt * 10.0)
+        score_pwr = float(round(pwr_sum / 10.0))
+        score_total = score_dist + score_comm + score_pwr
         rr = dict(r)
-        rr["score_turn"] = sturn
-        rr["score_total"] = total
+        rr["score_dist"] = score_dist
+        rr["score_comm"] = score_comm
+        rr["score_pwr"] = score_pwr
+        rr["score_total"] = score_total
         out.append(rr)
     return out
 
 
 def render_results() -> None:
     st.header("リザルト（結果）")
-    include_power = bool(st.session_state.get("include_power", True))
-    include_comm = bool(st.session_state.get("include_comm", True))
-    st.write(f"点数モード：発電={'ON' if include_power else 'OFF'} / 通信={'ON' if include_comm else 'OFF'}")
-
+    
     log_rows = st.session_state.get("log", [])
     if not log_rows:
         st.info("まだ実行していません。左の『実行！』を押して進めてね。")
         return
 
-    rows = compute_score_rows(log_rows, include_power, include_comm)
+    rows = compute_score_rows(log_rows)
+    # 最終スコア（最終ターンの距離を採用）
+    final_dist = float(rows[-1].get("dist_km", 0.0))
+    comm_cnt = int(round(sum(float(r.get("comm", 0.0)) for r in rows)))
+    pwr_sum = float(sum(float(r.get("pwr", 0.0)) for r in rows))
+
+    score_dist_final = float(score_from_distance(final_dist))
+    score_comm_final = float(comm_cnt * 10.0)
+    score_pwr_final = float(round(pwr_sum / 10.0))
+    total_score = score_dist_final + score_comm_final + score_pwr_final
+
+    cA, cB, cC, cD = st.columns(4)
+    cA.metric("合計点", f"{total_score:.0f} 点")
+    cB.metric("距離点（最終）", f"{score_dist_final:.0f}")
+    cC.metric("通信点", f"{score_comm_final:.0f}（OK回数={comm_cnt}）")
+    cD.metric("発電点", f"{score_pwr_final:.0f}（合計={pwr_sum:.0f}%）")
+
     total_score = float(rows[-1]["score_total"])
-    st.metric("合計点", f"{total_score:.0f} 点")
 
     turns = [int(r.get("turn", i+1)) for i, r in enumerate(rows)]
     bi = [float(r.get("beta_in", 0.0)) for r in rows]
@@ -575,40 +586,65 @@ def render_results() -> None:
     pwr = [float(r.get("pwr", 0.0)) for r in rows]
     comm_q = [float(r.get("comm_q", 0.0)) for r in rows]
     dist = [float(r.get("dist_km", 0.0)) for r in rows]
-    score_turn = [float(r.get("score_turn", 0.0)) for r in rows]
+    score_turn = [float(r.get("score_dist", 0.0)) for r in rows]
     score_total = [float(r.get("score_total", 0.0)) for r in rows]
 
-    st.subheader("太陽系2D（リザルト）")
-    # 地球・金星は “円” を描き、IKAROSは転移を描く
-    th = np.linspace(0.0, 2*math.pi, 400)
-    earth_orb = np.c_[np.cos(th), np.sin(th)]
-    venus_orb = 0.723 * earth_orb
+    st.subheader("リザルト：2D軌道 と B-plane")
 
-    days = np.linspace(0.0, C.total_days, 260)
-    S = []
-    for dd in days:
-        sun2, earth2, venus2, sc2 = get_positions_3d(float(dd), C.total_days)
-        S.append(sc2[:2])
-    S = np.array(S)
+    colL, colR = st.columns(2)
 
-    # ターンごとのIKAROS位置（ゲーム時刻で取る）
-    pts = []
-    for r in rows:
-        dd = float(r.get("day", 0.0))
-        sun2, earth2, venus2, sc2 = get_positions_3d(dd, C.total_days)
-        pts.append(sc2[:2])
-    pts = np.array(pts)
+    with colL:
+        st.write("### 太陽系2D")
+        # 地球・金星は “円” を描き、IKAROSは転移を描く（曲線）
+        th = np.linspace(0.0, 2*math.pi, 400)
+        earth_orb = np.c_[np.cos(th), np.sin(th)]
+        venus_orb = 0.723 * earth_orb
 
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=earth_orb[:,0], y=earth_orb[:,1], mode="lines", name="地球の軌道（円）"))
-    fig2.add_trace(go.Scatter(x=venus_orb[:,0], y=venus_orb[:,1], mode="lines", name="金星の軌道（円）"))
-    fig2.add_trace(go.Scatter(x=S[:,0], y=S[:,1], mode="lines", name="IKAROS（転移）"))
-    if len(pts) > 0:
-        fig2.add_trace(go.Scatter(x=pts[:,0], y=pts[:,1], mode="lines+markers", name="ターン位置"))
-    fig2.add_trace(go.Scatter(x=[0.0], y=[0.0], mode="markers+text", name="太陽", text=["☀"], textposition="top center"))
-    fig2.update_layout(height=520, margin=dict(l=10,r=10,t=10,b=10), xaxis_title="x [AU]", yaxis_title="y [AU]")
-    fig2.update_yaxes(scaleanchor="x", scaleratio=1)
-    st.plotly_chart(fig2, use_container_width=True)
+        days = np.linspace(0.0, C.total_days, 260)
+        S = []
+        for dd in days:
+            sun2, earth2, venus2, sc2 = get_positions_3d(float(dd), C.total_days)
+            S.append(sc2[:2])
+        S = np.array(S)
+
+        # ターンごとのIKAROS位置（ゲーム時刻で取る）
+        pts = []
+        for r in rows:
+            dd = float(r.get("day", 0.0))
+            sun2, earth2, venus2, sc2 = get_positions_3d(dd, C.total_days)
+            pts.append(sc2[:2])
+        pts = np.array(pts)
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=earth_orb[:,0], y=earth_orb[:,1], mode="lines", name="地球の軌道（円）"))
+        fig2.add_trace(go.Scatter(x=venus_orb[:,0], y=venus_orb[:,1], mode="lines", name="金星の軌道（円）"))
+        fig2.add_trace(go.Scatter(x=S[:,0], y=S[:,1], mode="lines", name="IKAROS（転移・曲線）"))
+        if len(pts) > 0:
+            fig2.add_trace(go.Scatter(x=pts[:,0], y=pts[:,1], mode="markers", name="ターン位置（点）"))
+        # スタート点（0日）も置く
+        sun0, earth0, venus0, sc0 = get_positions_3d(0.0, C.total_days)
+        fig2.add_trace(go.Scatter(x=[sc0[0]], y=[sc0[1]], mode="markers", name="スタート", marker=dict(symbol="circle-open")))
+
+        fig2.add_trace(go.Scatter(x=[0.0], y=[0.0], mode="markers+text", name="太陽", text=["☀"], textposition="top center"))
+        fig2.update_layout(height=520, margin=dict(l=10,r=10,t=10,b=10), xaxis_title="x [AU]", yaxis_title="y [AU]")
+        fig2.update_yaxes(scaleanchor="x", scaleratio=1)
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with colR:
+        st.write("### B-plane（β-plane）")
+        hist = np.array(st.session_state.get("history", [np.zeros(2)]), dtype=float)
+        x_hat = np.array(st.session_state.x_hat, dtype=float)
+        x_true = np.array(st.session_state.x_true, dtype=float)
+        target = np.array(C.target_bt_br_km, dtype=float)
+        figB = bplane_figure(
+            x_hat=x_hat,
+            x_true=x_true,
+            target=target,
+            pred_next=x_hat,
+            pred_circle_r=0.0,
+            history=hist,
+        )
+        st.plotly_chart(figB, use_container_width=True)
 
     st.subheader("β_in / β_out（時系列）")
     fig = go.Figure()
@@ -637,8 +673,10 @@ def render_results() -> None:
 
     st.subheader("点数（時系列）")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=turns, y=score_turn, mode="lines+markers", name="このターンの点"))
-    fig.add_trace(go.Scatter(x=turns, y=score_total, mode="lines+markers", name="累積点"))
+    fig.add_trace(go.Scatter(x=turns, y=score_turn, mode="lines+markers", name="距離点（その時点）"))
+    fig.add_trace(go.Scatter(x=turns, y=[float(r.get("score_comm", 0.0)) for r in rows], mode="lines+markers", name="通信点（累積）"))
+    fig.add_trace(go.Scatter(x=turns, y=[float(r.get("score_pwr", 0.0)) for r in rows], mode="lines+markers", name="発電点（累積）"))
+    fig.add_trace(go.Scatter(x=turns, y=score_total, mode="lines+markers", name="暫定合計"))
     fig.update_layout(height=360, xaxis_title="ターン", yaxis_title="点")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -654,36 +692,18 @@ if st.session_state.get("page", "play") == "result":
 
 
 with st.sidebar:
-    st.header("ゲーム")
-    st.write("**5ターン**で、目標（★）に近づけます。")
     if st.button("リセット（最初から）"):
         init_state()
         st.rerun()
 
-    st.divider()
-    st.header("操作（このターン）")
     beta_in = st.slider("β_in（deg）", -C.beta_in_deg_lim, C.beta_in_deg_lim, 0.0, 0.5)
     beta_out = st.slider("β_out（deg）", -C.beta_out_deg_lim, C.beta_out_deg_lim, 0.0, 0.5)
 
-    st.divider()
-    st.header("点数に入れるもの")
-    st.session_state.include_power = st.checkbox("発電（太陽向き）も点数に入れる", value=bool(st.session_state.get("include_power", True)))
-    st.session_state.include_comm = st.checkbox("通信（地球向き）も点数に入れる", value=bool(st.session_state.get("include_comm", True)))
-
     turn = int(st.session_state.turn)
-    can_step = turn < (C.n_turns - 1)
+    can_step = turn < C.n_turns
     if st.button("実行！（このターンを進める）", disabled=not can_step):
         step_once(beta_in, beta_out)
         st.rerun()
-
-    st.header("本格っぽい中身")
-    st.write("状態遷移（模型）")
-    st.code("x_{k+1} = x_k + drift + k · C(k) · [β_in, β_out]^T", language="text")
-    st.write("このターンの C(k)（km/deg）")
-    st.write(get_sensitivity(int(st.session_state.turn)))
-
-    st.write(f"k_true（本当）={st.session_state['k_true']:.2f} / k_hat（想定）={st.session_state['k_hat']:.2f}")
-    st.write("※通信できたら推定が一気に良くなる（模型）")
 
 
 turn = int(st.session_state.turn)
@@ -722,23 +742,25 @@ pred_r = 2200.0  # ばらつき表示（固定の目安）
 d_now = float(np.linalg.norm(x_hat - target))
 score_now = score_from_distance(d_now)
 
-# いまの点数（距離 + おまけ）
-bonus_pwr_now = 20.0 * (pwr_now / 100.0) if bool(st.session_state.get("include_power", True)) else 0.0
-bonus_comm_now = 20.0 if (bool(st.session_state.get("include_comm", True)) and comm_now) else 0.0
-score_now_with_bonus = float(score_now) + float(bonus_pwr_now) + float(bonus_comm_now)
+# これまでの通信OK回数と発電合計（実行済みログから）
+log_rows = st.session_state.get("log", [])
+comm_cnt = int(round(sum(float(r.get("comm", 0.0)) for r in log_rows)))
+pwr_sum = float(sum(float(r.get("pwr", 0.0)) for r in log_rows))
 
-# これまでの合計点（ログから計算）
-rows_tmp = compute_score_rows(st.session_state.get("log", []), bool(st.session_state.get("include_power", True)), bool(st.session_state.get("include_comm", True)))
-score_total_sofar = float(rows_tmp[-1]["score_total"]) if rows_tmp else 0.0
+# 暫定スコア（いまの距離を使った目安）
+score_comm = float(comm_cnt * 10.0)
+score_pwr = float(round(pwr_sum / 10.0))
+score_est = float(score_now) + score_comm + score_pwr
+
 
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("ターン", f"{turn+1}/{C.n_turns}")
 c2.metric("経過日数", f"{day:.0f} / {C.total_days:.0f} 日")
 c3.metric("距離（推定）", f"{d_now:,.0f} km")
-c4.metric("このターン点", f"{score_now_with_bonus:.0f} 点")
+c4.metric("暫定スコア", f"{score_est:.0f} 点")
 c5.metric("発電量（0-100%）", f"{pwr_now:.0f} %")
 c6.metric("通信", "OK ✅" if comm_now else "NG ❌")
-c7.metric("合計点（ここまで）", f"{score_total_sofar:.0f} 点")
+c7.metric("通信OK回数", f"{comm_cnt} 回")
 
 
 tabs = st.tabs(["B-plane（ダーツ盤）", "太陽系2D（雰囲気）", "βマップ（発電/通信）", "3D（ベクトル）"])
@@ -759,7 +781,7 @@ with tabs[0]:
 
     st.info("この版は『乱数なし』です。ズレは“ドリフト”と“モデル差(k_true≠k_hat)”で起きます。")
 
-    if turn == C.n_turns - 1:
+    if turn >= C.n_turns:
         d_fin = float(np.linalg.norm(x_hat - target))
         st.divider()
         st.subheader("ゲーム終了！")
@@ -769,26 +791,28 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("太陽・地球・金星・IKAROS（2Dの雰囲気）")
 
-    # 地球・金星の“円軌道”をちゃんと描く（見た目を安定させる）
-    th = np.linspace(0.0, 2*math.pi, 500)
-    earth_orb = np.c_[np.cos(th), np.sin(th)]
-    venus_orb = 0.723 * earth_orb
+    # 地球・金星の“円軌道”を、実行済み/未実行で分けて描く（見た目の進捗が分かる）
+    TE = 365.25
+    TV = 224.701
+    wE = 2 * math.pi / TE
+    wV = 2 * math.pi / TV
 
-    # IKAROSの転移（ゲーム期間ぶん）
-    days = np.linspace(0.0, C.total_days, 260)
-    S = []
-    for dd in days:
-        sun2, earth2, venus2, sc2 = get_positions_3d(float(dd), C.total_days)
-        S.append(sc2[:2])
-    S = np.array(S)
+    sun0, earth0, venus0, sc0 = get_positions_3d(0.0, C.total_days)
+    thE0 = math.atan2(float(earth0[1]), float(earth0[0]))
+    thV0 = math.atan2(float(venus0[1]), float(venus0[0]))
 
-    # いまの時刻まで＝実行済み / これから先＝未実行
-    idx_now = int(np.searchsorted(days, day))
-    idx_now = max(1, min(idx_now, len(days)-1))
+    N = 520
+    tE = np.linspace(0.0, TE, N)
+    tV = np.linspace(0.0, TV, N)
+    earth_orb = np.c_[np.cos(thE0 + wE * tE), np.sin(thE0 + wE * tE)]
+    venus_orb = 0.723 * np.c_[np.cos(thV0 + wV * tV), np.sin(thV0 + wV * tV)]
 
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=earth_orb[:,0], y=earth_orb[:,1], mode="lines", name="地球の軌道（円）"))
-    fig2.add_trace(go.Scatter(x=venus_orb[:,0], y=venus_orb[:,1], mode="lines", name="金星の軌道（円）"))
+    tE_now = float(day % TE)
+    tV_now = float(day % TV)
+    iE = int(np.searchsorted(tE, tE_now))
+    iV = int(np.searchsorted(tV, tV_now))
+    iE = max(1, min(iE, N-1))
+    iV = max(1, min(iV, N-1))
 
     fig2.add_trace(go.Scatter(x=S[:idx_now,0], y=S[:idx_now,1], mode="lines", name="IKAROS（実行済み）", line=dict(dash="solid")))
     fig2.add_trace(go.Scatter(x=S[idx_now:,0], y=S[idx_now:,1], mode="lines", name="IKAROS（未実行）", line=dict(dash="dash")))
