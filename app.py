@@ -20,7 +20,7 @@ import io
 import pathlib
 
 
-APP_BUILD = "v14.1-results-bplane-sidebar-score-2026-02-14"
+APP_BUILD = "v14.2-fix-play-2d-2026-02-14"
 
 AU_KM = 149_597_870.7  # 1 AU in km
 DEFAULT_TEX_PATH = pathlib.Path(__file__).parent / "assets" / "ikaros_texture.png"
@@ -791,7 +791,7 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("太陽・地球・金星・IKAROS（2Dの雰囲気）")
 
-    # 地球・金星の“円軌道”を、実行済み/未実行で分けて描く（見た目の進捗が分かる）
+    # --- 1) 地球・金星：円軌道を「実行済み/未実行」で分ける ---
     TE = 365.25
     TV = 224.701
     wE = 2 * math.pi / TE
@@ -811,24 +811,59 @@ with tabs[1]:
     tV_now = float(day % TV)
     iE = int(np.searchsorted(tE, tE_now))
     iV = int(np.searchsorted(tV, tV_now))
-    iE = max(1, min(iE, N-1))
-    iV = max(1, min(iV, N-1))
+    iE = max(1, min(iE, N - 1))
+    iV = max(1, min(iV, N - 1))
 
-    fig2.add_trace(go.Scatter(x=S[:idx_now,0], y=S[:idx_now,1], mode="lines", name="IKAROS（実行済み）", line=dict(dash="solid")))
-    fig2.add_trace(go.Scatter(x=S[idx_now:,0], y=S[idx_now:,1], mode="lines", name="IKAROS（未実行）", line=dict(dash="dash")))
+    # --- 2) IKAROS：転移の曲線（ゲーム期間ぶん） ---
+    days = np.linspace(0.0, C.total_days, 260)
+    S = []
+    for dd in days:
+        sun2, earth2, venus2, sc2 = get_positions_3d(float(dd), C.total_days)
+        S.append(sc2[:2])
+    S = np.array(S)
 
-    fig2.add_trace(go.Scatter(x=[0.0], y=[0.0], mode="markers+text", name="太陽", text=["☀"], textposition="top center"))
-    fig2.add_trace(go.Scatter(x=[earth[0]], y=[earth[1]], mode="markers+text", name="地球（いま）", text=["🌍"], textposition="top center"))
-    fig2.add_trace(go.Scatter(x=[venus[0]], y=[venus[1]], mode="markers+text", name="金星（いま）", text=["♀"], textposition="top center"))
-    fig2.add_trace(go.Scatter(x=[sc[0]], y=[sc[1]], mode="markers+text", name="IKAROS（いま）", text=["🚀"], textposition="top center"))
+    idx_now = int(np.searchsorted(days, day))
+    idx_now = max(1, min(idx_now, len(days) - 1))
 
-    fig2.update_layout(height=650, margin=dict(l=10,r=10,t=10,b=10), xaxis_title="x [AU]", yaxis_title="y [AU]")
+    # --- 3) 描画 ---
+    fig2 = go.Figure()
+
+    # 地球・金星（実行済み/未実行）
+    fig2.add_trace(go.Scatter(x=earth_orb[:iE, 0], y=earth_orb[:iE, 1], mode="lines",
+                              name="地球（実行済み）", line=dict(dash="solid")))
+    fig2.add_trace(go.Scatter(x=earth_orb[iE:, 0], y=earth_orb[iE:, 1], mode="lines",
+                              name="地球（未実行）", line=dict(dash="dash")))
+
+    fig2.add_trace(go.Scatter(x=venus_orb[:iV, 0], y=venus_orb[:iV, 1], mode="lines",
+                              name="金星（実行済み）", line=dict(dash="solid")))
+    fig2.add_trace(go.Scatter(x=venus_orb[iV:, 0], y=venus_orb[iV:, 1], mode="lines",
+                              name="金星（未実行）", line=dict(dash="dash")))
+
+    # IKAROS（実行済み/未実行）
+    fig2.add_trace(go.Scatter(x=S[:idx_now, 0], y=S[:idx_now, 1], mode="lines",
+                              name="IKAROS（実行済み）", line=dict(dash="solid")))
+    fig2.add_trace(go.Scatter(x=S[idx_now:, 0], y=S[idx_now:, 1], mode="lines",
+                              name="IKAROS（未実行）", line=dict(dash="dash")))
+
+    # 現在位置
+    fig2.add_trace(go.Scatter(x=[0.0], y=[0.0], mode="markers+text", name="太陽",
+                              text=["☀"], textposition="top center"))
+    fig2.add_trace(go.Scatter(x=[earth[0]], y=[earth[1]], mode="markers+text", name="地球（いま）",
+                              text=["🌍"], textposition="top center"))
+    fig2.add_trace(go.Scatter(x=[venus[0]], y=[venus[1]], mode="markers+text", name="金星（いま）",
+                              text=["♀"], textposition="top center"))
+    fig2.add_trace(go.Scatter(x=[sc[0]], y=[sc[1]], mode="markers+text", name="IKAROS（いま）",
+                              text=["🚀"], textposition="top center"))
+
+    fig2.update_layout(height=650, margin=dict(l=10, r=10, t=10, b=10),
+                       xaxis_title="x [AU]", yaxis_title="y [AU]")
     fig2.update_yaxes(scaleanchor="x", scaleratio=1)
     st.plotly_chart(fig2, use_container_width=True)
 
     st.write("※これは“雰囲気”の絵です（本当の軌道計算ではありません）。")
 
 with tabs[2]:
+
     st.subheader("βマップ（発電：cos / 通信：60°ルール）")
     st.write("いまの幾何（太陽・地球の方向）で、β_in/out を動かしたときの発電と通信を見ます。")
 
